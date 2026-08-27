@@ -143,6 +143,13 @@ def render_month_calendar(events_by_date, year, month, key_prefix):
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
+st.markdown('<div style="font-size:11px; color:#8A8177; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:2px;">Season</div>', unsafe_allow_html=True)
+season_choice = st.pills("Season", ["Spring (2k)", "Fall (5k)"], default="Spring (2k)", label_visibility="collapsed", key="team_season")
+if season_choice is None:
+    season_choice = "Spring (2k)"
+season = "2k" if "2k" in season_choice else "5k"
+st.caption("Affects which regattas show under Lineups.")
+
 tab_lineups, tab_roster, tab_announce, tab_calendar, tab_signups = st.tabs(
     ["Lineups", "Roster", "Announcements", "Calendar", "Sign-Ups"]
 )
@@ -151,23 +158,28 @@ with tab_lineups:
     st.title("Lineups")
 
     regattas_df = load_regattas()
-    regatta_names = regattas_df["name"].tolist() if not regattas_df.empty else []
+    if not regattas_df.empty:
+        regattas_df = regattas_df[(regattas_df["name"] == "Practice") | (regattas_df["season"] == season)]
 
-    if not regatta_names:
-        st.info("No regattas set up yet — check back soon.")
+    if regattas_df.empty:
+        st.info("No regattas set up yet for this season — check back soon, or try the other season.")
     else:
-        selected_regatta = st.selectbox("Regatta", regatta_names)
         lineups_df = load_lineups()
-        this_regatta = lineups_df[lineups_df["regatta"] == selected_regatta]
-
-        if this_regatta.empty:
-            st.info(f"No lineups posted yet for {selected_regatta}.")
-        else:
+        any_shown = False
+        for _, reg in regattas_df.iterrows():
+            this_regatta = lineups_df[lineups_df["regatta"] == reg["name"]]
+            if this_regatta.empty:
+                continue
+            any_shown = True
+            st.markdown(f"## {reg['name']}")
             for boat_name, group in this_regatta.groupby("boat_name", sort=True):
-                st.markdown(f"### {boat_name}")
+                st.markdown(f"**{boat_name}**")
                 display = group.sort_values("seat_number")[["seat_number", "side", "rower_name"]]
                 display.columns = ["Seat", "Side", "Rower"]
                 st.dataframe(display, width='stretch', hide_index=True)
+            st.divider()
+        if not any_shown:
+            st.info("No lineups posted yet for this season.")
 
 with tab_roster:
     st.title("Roster")
