@@ -7,6 +7,7 @@ Run with:  streamlit run team_view.py
 
 import sqlite3
 import calendar as cal_module
+import datetime as dt_module
 import pandas as pd
 import streamlit as st
 
@@ -313,7 +314,7 @@ with tab_signups:
 
 with tab_availability:
     st.title("Availability")
-    st.caption("Check any day you know you'll miss, add a reason, then save. Days too close to happen already are locked so coaches aren't surprised last-minute.")
+    st.caption("Practice is assumed every day except Sunday, unless coaches say otherwise. Click a day to mark yourself out, add a reason, then save. Days too close are locked so coaches aren't surprised last-minute.")
 
     roster_names_df2 = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
     if roster_names_df2.empty:
@@ -325,54 +326,109 @@ with tab_availability:
         settings_df2 = run_query("SELECT * FROM AttendanceSettings LIMIT 1")
         deadline_days = int(settings_df2["days_before_deadline"].iloc[0]) if not settings_df2.empty else 1
 
-        practice_dates_df = run_query("SELECT DISTINCT event_date, event_type AS label FROM PracticeEvents")
-        regatta_dates_df = run_query("SELECT DISTINCT event_date, name AS label FROM Regattas WHERE event_date IS NOT NULL")
-        all_event_days = pd.concat([
-            practice_dates_df.rename(columns={"label": "label"}),
-            regatta_dates_df.rename(columns={"label": "label"}),
-        ]).drop_duplicates(subset=["event_date"]).sort_values("event_date")
-
-        today = pd.Timestamp.now().date()
-        window_end = today + pd.Timedelta(days=30)
-        all_event_days["date_obj"] = pd.to_datetime(all_event_days["event_date"]).dt.date
-        upcoming_days = all_event_days[(all_event_days["date_obj"] >= today) & (all_event_days["date_obj"] <= window_end)]
+        practice_events_df = run_query("SELECT event_date, event_type FROM PracticeEvents")
+        practice_by_date = dict(zip(practice_events_df["event_date"], practice_events_df["event_type"]))
+        regatta_dates_df = run_query("SELECT event_date, name FROM Regattas WHERE event_date IS NOT NULL")
+        regatta_by_date = dict(zip(regatta_dates_df["event_date"], regatta_dates_df["name"]))
 
         my_absences_df = run_query("SELECT event_date, reason FROM DayAbsences WHERE rower_id = ?", (my_id2,))
         my_absence_dates = dict(zip(my_absences_df["event_date"], my_absences_df["reason"]))
 
-        if upcoming_days.empty:
-            st.info("No upcoming practice or regatta days scheduled in the next 30 days.")
-        else:
-            checked_dates = {}
-            for _, day in upcoming_days.iterrows():
-                date_str = day["event_date"]
-                days_away = (day["date_obj"] - today).days
-                locked = days_away < deadline_days
-                already_marked = date_str in my_absence_dates
+        def day_status(date_str, date_obj):
+            """Returns (is_relevant, label) — the default-on-every-day-but-Sunday logic."""
+            if date_str in regatta_by_date:
+                return True, f"🏆 {regatta_by_date[date_str]}"
+            explicit = practice_by_date.get(date_str)
+            if explicit == "off":
+                return False, "Off"
+            if explicit is not None:
+                return True, {"water": "🚣 Water", "erg": "🏋️ Erg"}.get(explicit, explicit)
+            if date_obj.weekday() == 6:  # Sunday
+                return False, "Off (Sunday)"
+            return True, "Practice"
 
-                if locked:
-                    status = f" — 🔒 locked (within {deadline_days} day(s))" if not already_marked else f" — 🔒 locked, marked absent: {my_absence_dates[date_str] or 'no reason given'}"
-                    st.caption(f"{date_str} · {day['label']}{status}")
+        if "avail_cal_year" not in st.session_state:
+            st.session_state["avail_cal_year"] = pd.Timestamp.now().year
+            st.session_state["avail_cal_month"] = pd.Timestamp.now().month
+
+        nav1, nav2, nav3, nav4 = st.columns([1, 1, 3, 1])
+        if nav1.button("◀ Prev", key="avail_cal_prev"):
+            m, y = st.session_state["avail_cal_month"], st.session_state["avail_cal_year"]
+            st.session_state["avail_cal_month"], st.session_state["avail_cal_year"] = (m - 1, y) if m > 1 else (12, y - 1)
+            st.rerun()
+        if nav4.button("Next ▶", key="avail_cal_next"):
+            m, y = st.session_state["avail_cal_month"], st.session_state["avail_cal_year"]
+            st.session_state["avail_cal_month"], st.session_state["avail_cal_year"] = (m + 1, y) if m < 12 else (1, y + 1)
+            st.rerun()
+        cal_year, cal_month = st.session_state["avail_cal_year"], st.session_state["avail_cal_month"]
+        nav3.markdown(f"<h3 style='text-align:center; margin:0;'>{cal_module.month_name[cal_month]} {cal_year}</h3>", unsafe_allow_html=True)
+
+        weeks = cal_module.Calendar(firstweekday=6).monthdayscalendar(cal_year, cal_month)
+        today = pd.Timestamp.now().date()
+        checked_dates = {}
+
+        headers = st.columns(7)
+        for h, name in zip(headers, ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]):
+            h.markdown(f"<div style='text-align:center; font-size:11px; color:#8A8177; text-transform:uppercase;'>{name}</div>", unsafe_allow_html=True)
+
+        for week in weeks:
+            cols = st.columns(7)
+            for col, day in zip(cols, week):
+                if day == 0:
                     continue
+                date_obj = dt_module.date(cal_year, cal_month, day)
+                date_str = str(date_obj)
+                is_relevant, label = day_status(date_str, date_obj)
+                already_marked = date_str in my_absence_dates
+                is_past = date_obj < today
+                days_away = (date_obj - today).days
+                locked = (not is_past) and days_away < deadline_days
 
-                checked = st.checkbox(f"{date_str} · {day['label']}", value=already_marked, key=f"absent_{my_id2}_{date_str}")
-                if checked:
-                    reason = st.text_input("Reason", value=my_absence_dates.get(date_str, ""), key=f"reason_{my_id2}_{date_str}", label_visibility="collapsed", placeholder="Reason for missing this one")
-                    checked_dates[date_str] = reason
+                with col:
+                    if is_past:
+                        st.caption(f"{day}")
+                    elif not is_relevant:
+                        st.caption(f"{day} · {label}")
+                    elif locked:
+                        icon = "🔒✅" if already_marked else "🔒"
+                        st.caption(f"{day} {icon}")
+                    else:
+                        checked = st.checkbox(f"{day}", value=already_marked, key=f"absent_{my_id2}_{date_str}")
+                        if checked:
+                            checked_dates[date_str] = label
+
+        st.caption("🔒 = locked (too close to the deadline to change) · ✅ = you're marked absent")
+
+        if checked_dates:
+            st.divider()
+            st.subheader("Add a reason for each day you're missing")
+            reasons = {}
+            for date_str, label in sorted(checked_dates.items()):
+                reasons[date_str] = st.text_input(
+                    f"{date_str} · {label}", value=my_absence_dates.get(date_str, ""),
+                    key=f"reason_{my_id2}_{date_str}", placeholder="Reason (optional)",
+                )
 
             if st.button("💾 Save Absences"):
-                for _, day in upcoming_days.iterrows():
-                    date_str = day["event_date"]
-                    days_away = (day["date_obj"] - today).days
-                    if days_away < deadline_days:
-                        continue  # locked, don't touch
-                    if date_str in checked_dates:
-                        run_write(
-                            "INSERT INTO DayAbsences (rower_id, event_date, reason) VALUES (?, ?, ?) "
-                            "ON CONFLICT(rower_id, event_date) DO UPDATE SET reason = excluded.reason",
-                            (my_id2, date_str, checked_dates[date_str] or None),
-                        )
-                    elif date_str in my_absence_dates:
-                        run_write("DELETE FROM DayAbsences WHERE rower_id = ? AND event_date = ?", (my_id2, date_str))
+                # Reconcile every relevant day currently in view: checked+reason -> upsert, unchecked -> delete if it existed
+                for week in weeks:
+                    for day in week:
+                        if day == 0:
+                            continue
+                        date_obj = dt_module.date(cal_year, cal_month, day)
+                        date_str = str(date_obj)
+                        if date_obj < today:
+                            continue
+                        days_away = (date_obj - today).days
+                        if days_away < deadline_days:
+                            continue
+                        if date_str in checked_dates:
+                            run_write(
+                                "INSERT INTO DayAbsences (rower_id, event_date, reason) VALUES (?, ?, ?) "
+                                "ON CONFLICT(rower_id, event_date) DO UPDATE SET reason = excluded.reason",
+                                (my_id2, date_str, reasons.get(date_str) or None),
+                            )
+                        elif date_str in my_absence_dates:
+                            run_write("DELETE FROM DayAbsences WHERE rower_id = ? AND event_date = ?", (my_id2, date_str))
                 st.toast("Saved.", icon="💾")
                 st.rerun()
