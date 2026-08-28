@@ -34,8 +34,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource
 def get_conn():
+    # Not cached — Turso's remote connections can expire server-side ("stream
+    # not found"), and reusing a stale one crashes the app. Opening fresh each
+    # call is cheap; the @st.cache_data-decorated loaders below do the real
+    # work of avoiding repeat round-trips.
     try:
         has_turso_secrets = "TURSO_DATABASE_URL" in st.secrets and "TURSO_AUTH_TOKEN" in st.secrets
     except Exception:
@@ -84,13 +87,18 @@ def load_lineups():
         FROM Lineups l
         JOIN Rowers r ON r.rower_id = l.rower_id
         LEFT JOIN Regattas reg ON reg.regatta_id = l.regatta_id
+        WHERE l.is_visible_to_team = 1
         ORDER BY reg.name, l.boat_name, l.seat_number
     """)
 
 
 @st.cache_data(ttl=120)
 def load_announcements():
-    return run_query("SELECT * FROM Announcements ORDER BY posted_date DESC, announcement_id DESC")
+    today_str = str(pd.Timestamp.now().date())
+    return run_query(
+        "SELECT * FROM Announcements WHERE expires_date IS NULL OR expires_date >= ? ORDER BY posted_date DESC, announcement_id DESC",
+        (today_str,),
+    )
 
 
 @st.cache_data(ttl=120)
@@ -150,12 +158,13 @@ if season_choice is None:
 season = "2k" if "2k" in season_choice else "5k"
 st.caption("Affects which regattas show under Lineups.")
 
-tab_lineups, tab_roster, tab_announce, tab_calendar, tab_signups = st.tabs(
-    ["Lineups", "Roster", "Announcements", "Calendar", "Sign-Ups"]
+tab_lineups, tab_roster, tab_announce, tab_calendar, tab_signups, tab_availability = st.tabs(
+    ["Lineups", "Roster", "Announcements", "Calendar", "Sign-Ups", "Availability"]
 )
 
 with tab_lineups:
     st.title("Lineups")
+    st.caption("Click a regatta to see its lineups.")
 
     regattas_df = load_regattas()
     if not regattas_df.empty:
@@ -171,13 +180,12 @@ with tab_lineups:
             if this_regatta.empty:
                 continue
             any_shown = True
-            st.markdown(f"## {reg['name']}")
-            for boat_name, group in this_regatta.groupby("boat_name", sort=True):
-                st.markdown(f"**{boat_name}**")
-                display = group.sort_values("seat_number")[["seat_number", "side", "rower_name"]]
-                display.columns = ["Seat", "Side", "Rower"]
-                st.dataframe(display, width='stretch', hide_index=True)
-            st.divider()
+            with st.expander(f"{reg['name']} ({this_regatta['boat_name'].nunique()} boat(s))"):
+                for boat_name, group in this_regatta.groupby("boat_name", sort=True):
+                    st.markdown(f"**{boat_name}**")
+                    display = group.sort_values("seat_number")[["seat_number", "side", "rower_name"]]
+                    display.columns = ["Seat", "Side", "Rower"]
+                    st.dataframe(display, width='stretch', hide_index=True)
         if not any_shown:
             st.info("No lineups posted yet for this season.")
 
@@ -236,7 +244,7 @@ with tab_calendar:
 
 with tab_signups:
     st.title("Sign-Ups")
-    st.caption("Pick your name once, then sign up for anything below.")
+    st.caption("Pick your name once, then sign up for a specific time slot below.")
 
     roster_names_df = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
     if roster_names_df.empty:
@@ -252,36 +260,50 @@ with tab_signups:
             st.info("No sign-up events posted yet.")
         else:
             upcoming = events_df[events_df["event_date"] >= today_str]
-            past = events_df[events_df["event_date"] < today_str]
 
             def render_event(ev):
-                responses_df = run_query(
-                    "SELECT r.rower_id, r.rower_name FROM SignUpResponses sr JOIN Rowers r ON r.rower_id = sr.rower_id WHERE sr.event_id = ?",
-                    (int(ev["event_id"]),),
-                )
-                names = responses_df["rower_name"].tolist()
-                already_signed_up = my_id in responses_df["rower_id"].tolist()
-                has_cap = pd.notna(ev.get("max_spots"))
-                is_full = has_cap and len(names) >= int(ev["max_spots"])
-                spots_text = f" — {len(names)}/{int(ev['max_spots'])} spots filled" if has_cap else f" — {len(names)} signed up"
-                time_text = f" ({ev['time_label']})" if pd.notna(ev.get("time_label")) and ev.get("time_label") else ""
+                eid = int(ev["event_id"])
+                deadline_passed = pd.notna(ev.get("signup_deadline")) and ev["signup_deadline"] < today_str
+                deadline_text = f" · sign-ups close {ev['signup_deadline']}" if pd.notna(ev.get("signup_deadline")) else ""
 
                 with st.container(border=True):
-                    st.markdown(f"**{ev['title']}** — {ev['event_date']}{time_text}{spots_text}")
+                    st.markdown(f"**{ev['title']}** — {ev['event_date']}{deadline_text}")
                     if pd.notna(ev.get("notes")) and ev.get("notes"):
                         st.caption(ev["notes"])
-                    st.write(", ".join(names) if names else "*Nobody signed up yet*")
+                    if deadline_passed:
+                        st.caption("⚠ Sign-ups are closed for this event.")
 
-                    if already_signed_up:
-                        if st.button("Remove me", key=f"remove_{ev['event_id']}"):
-                            run_write("DELETE FROM SignUpResponses WHERE event_id = ? AND rower_id = ?", (int(ev["event_id"]), my_id))
-                            st.rerun()
-                    elif is_full:
-                        st.caption("Full.")
-                    else:
-                        if st.button("Sign me up", key=f"signup_{ev['event_id']}"):
-                            run_write("INSERT OR IGNORE INTO SignUpResponses (event_id, rower_id) VALUES (?, ?)", (int(ev["event_id"]), my_id))
-                            st.rerun()
+                    slots_df = run_query("SELECT * FROM SignUpSlots WHERE event_id = ? ORDER BY start_time", (eid,))
+                    if slots_df.empty:
+                        st.caption("No time slots posted for this yet.")
+                        return
+
+                    for _, slot in slots_df.iterrows():
+                        sid = int(slot["slot_id"])
+                        responses_df = run_query(
+                            "SELECT r.rower_id, r.rower_name FROM SignUpResponses sr JOIN Rowers r ON r.rower_id = sr.rower_id WHERE sr.slot_id = ?",
+                            (sid,),
+                        )
+                        names = responses_df["rower_name"].tolist()
+                        already_signed_up = my_id in responses_df["rower_id"].tolist()
+                        max_spots = int(slot["max_spots"]) if pd.notna(slot.get("max_spots")) else None
+                        is_full = max_spots is not None and len(names) >= max_spots
+                        spots_text = f"{len(names)}/{max_spots}" if max_spots is not None else f"{len(names)}"
+
+                        sc1, sc2 = st.columns([3, 1])
+                        sc1.markdown(f"**{slot['start_time']}–{slot['end_time']}** · {spots_text} spots — {', '.join(names) if names else '*nobody yet*'}")
+                        if already_signed_up:
+                            if sc2.button("Remove me", key=f"remove_{sid}"):
+                                run_write("DELETE FROM SignUpResponses WHERE slot_id = ? AND rower_id = ?", (sid, my_id))
+                                st.rerun()
+                        elif deadline_passed:
+                            sc2.caption("Closed")
+                        elif is_full:
+                            sc2.caption("Full")
+                        else:
+                            if sc2.button("Sign up", key=f"signup_{sid}"):
+                                run_write("INSERT OR IGNORE INTO SignUpResponses (event_id, rower_id, slot_id) VALUES (?, ?, ?)", (eid, my_id, sid))
+                                st.rerun()
 
             if upcoming.empty:
                 st.info("No upcoming sign-ups right now.")
@@ -289,7 +311,68 @@ with tab_signups:
                 for _, ev in upcoming.iterrows():
                     render_event(ev)
 
-            if not past.empty:
-                with st.expander(f"Past sign-ups ({len(past)})"):
-                    for _, ev in past.iterrows():
-                        render_event(ev)
+with tab_availability:
+    st.title("Availability")
+    st.caption("Check any day you know you'll miss, add a reason, then save. Days too close to happen already are locked so coaches aren't surprised last-minute.")
+
+    roster_names_df2 = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
+    if roster_names_df2.empty:
+        st.info("No rowers on the roster yet.")
+    else:
+        my_name2 = st.selectbox("I am:", roster_names_df2["rower_name"].tolist(), key="avail_my_name")
+        my_id2 = int(roster_names_df2[roster_names_df2["rower_name"] == my_name2]["rower_id"].iloc[0])
+
+        settings_df2 = run_query("SELECT * FROM AttendanceSettings LIMIT 1")
+        deadline_days = int(settings_df2["days_before_deadline"].iloc[0]) if not settings_df2.empty else 1
+
+        practice_dates_df = run_query("SELECT DISTINCT event_date, event_type AS label FROM PracticeEvents")
+        regatta_dates_df = run_query("SELECT DISTINCT event_date, name AS label FROM Regattas WHERE event_date IS NOT NULL")
+        all_event_days = pd.concat([
+            practice_dates_df.rename(columns={"label": "label"}),
+            regatta_dates_df.rename(columns={"label": "label"}),
+        ]).drop_duplicates(subset=["event_date"]).sort_values("event_date")
+
+        today = pd.Timestamp.now().date()
+        window_end = today + pd.Timedelta(days=30)
+        all_event_days["date_obj"] = pd.to_datetime(all_event_days["event_date"]).dt.date
+        upcoming_days = all_event_days[(all_event_days["date_obj"] >= today) & (all_event_days["date_obj"] <= window_end)]
+
+        my_absences_df = run_query("SELECT event_date, reason FROM DayAbsences WHERE rower_id = ?", (my_id2,))
+        my_absence_dates = dict(zip(my_absences_df["event_date"], my_absences_df["reason"]))
+
+        if upcoming_days.empty:
+            st.info("No upcoming practice or regatta days scheduled in the next 30 days.")
+        else:
+            checked_dates = {}
+            for _, day in upcoming_days.iterrows():
+                date_str = day["event_date"]
+                days_away = (day["date_obj"] - today).days
+                locked = days_away < deadline_days
+                already_marked = date_str in my_absence_dates
+
+                if locked:
+                    status = f" — 🔒 locked (within {deadline_days} day(s))" if not already_marked else f" — 🔒 locked, marked absent: {my_absence_dates[date_str] or 'no reason given'}"
+                    st.caption(f"{date_str} · {day['label']}{status}")
+                    continue
+
+                checked = st.checkbox(f"{date_str} · {day['label']}", value=already_marked, key=f"absent_{my_id2}_{date_str}")
+                if checked:
+                    reason = st.text_input("Reason", value=my_absence_dates.get(date_str, ""), key=f"reason_{my_id2}_{date_str}", label_visibility="collapsed", placeholder="Reason for missing this one")
+                    checked_dates[date_str] = reason
+
+            if st.button("💾 Save Absences"):
+                for _, day in upcoming_days.iterrows():
+                    date_str = day["event_date"]
+                    days_away = (day["date_obj"] - today).days
+                    if days_away < deadline_days:
+                        continue  # locked, don't touch
+                    if date_str in checked_dates:
+                        run_write(
+                            "INSERT INTO DayAbsences (rower_id, event_date, reason) VALUES (?, ?, ?) "
+                            "ON CONFLICT(rower_id, event_date) DO UPDATE SET reason = excluded.reason",
+                            (my_id2, date_str, checked_dates[date_str] or None),
+                        )
+                    elif date_str in my_absence_dates:
+                        run_write("DELETE FROM DayAbsences WHERE rower_id = ? AND event_date = ?", (my_id2, date_str))
+                st.toast("Saved.", icon="💾")
+                st.rerun()
