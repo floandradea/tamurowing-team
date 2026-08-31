@@ -159,8 +159,8 @@ if season_choice is None:
 season = "2k" if "2k" in season_choice else "5k"
 st.caption("Affects which regattas show under Lineups.")
 
-tab_lineups, tab_roster, tab_announce, tab_calendar, tab_signups, tab_availability = st.tabs(
-    ["Lineups", "Roster", "Announcements", "Calendar", "Sign-Ups", "Availability"]
+tab_lineups, tab_roster, tab_announce, tab_calendar, tab_signups, tab_availability, tab_weekly = st.tabs(
+    ["Lineups", "Roster", "Announcements", "Calendar", "Sign-Ups", "Availability", "Weekly Schedule"]
 )
 
 with tab_lineups:
@@ -432,3 +432,50 @@ with tab_availability:
                             run_write("DELETE FROM DayAbsences WHERE rower_id = ? AND event_date = ?", (my_id2, date_str))
                 st.toast("Saved.", icon="💾")
                 st.rerun()
+
+with tab_weekly:
+    st.title("Weekly Schedule")
+    st.caption("Where to show up each day — water or land — and who's coaching. Updated by coaches every weekend.")
+
+    week_start2 = st.date_input("Week of", value=pd.Timestamp.now().date(), key="weekly_view_start")
+    week_start2_dt = pd.Timestamp(week_start2)
+    monday2 = week_start2_dt - pd.Timedelta(days=week_start2_dt.weekday())
+    weekdays2 = [monday2 + pd.Timedelta(days=i) for i in range(5)]
+
+    st.info("Every day you're either not scheduled, on land (ergs), or on the water. If you're on the water, boat lineups get sorted out once everyone's at the lake.")
+
+    for day in weekdays2:
+        date_str = str(day.date())
+        assignments_df = run_query("""
+            SELECT r.rower_name, r.gender, da.location, da.is_coxswain
+            FROM DailyAssignments da JOIN Rowers r ON r.rower_id = da.rower_id
+            WHERE da.event_date = ?
+        """, (date_str,))
+        coaches_df = run_query("SELECT location, coach_name FROM DailyCoaches WHERE event_date = ?", (date_str,))
+        coach_map = dict(zip(coaches_df["location"], coaches_df["coach_name"]))
+
+        with st.container(border=True):
+            st.markdown(f"### {day.strftime('%A')} — {date_str}")
+            if assignments_df.empty:
+                st.caption("Not posted yet.")
+                continue
+
+            wc, lc = st.columns(2)
+            with wc:
+                water_group = assignments_df[assignments_df["location"] == "water"]
+                st.markdown(f"**🚣 Water** — Coach: {coach_map.get('water') or '—'}")
+                if water_group.empty:
+                    st.caption("Nobody assigned.")
+                else:
+                    for _, r in water_group.sort_values("rower_name").iterrows():
+                        cox_tag = " (cox)" if r["is_coxswain"] else ""
+                        st.markdown(f"- {r['rower_name']}{cox_tag}")
+            with lc:
+                land_group = assignments_df[assignments_df["location"] == "land"]
+                st.markdown(f"**🏋️ Land** — Coach: {coach_map.get('land') or '—'}")
+                if land_group.empty:
+                    st.caption("Nobody assigned.")
+                else:
+                    for _, r in land_group.sort_values("rower_name").iterrows():
+                        st.markdown(f"- {r['rower_name']}")
+
