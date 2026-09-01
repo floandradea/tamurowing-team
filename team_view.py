@@ -107,6 +107,39 @@ def load_events():
     return run_query("SELECT * FROM PracticeEvents ORDER BY event_date ASC")
 
 
+@st.cache_data(ttl=120)
+def load_signup_events_cal():
+    return run_query("SELECT event_date, title FROM SignUpEvents")
+
+
+@st.cache_data(ttl=120)
+def load_regattas_cal():
+    return run_query("SELECT name, event_date FROM Regattas WHERE event_date IS NOT NULL")
+
+
+@st.cache_data(ttl=120)
+def load_gendered_assignments_by_date():
+    return run_query("""
+        SELECT da.event_date, r.gender, da.location, COUNT(*) AS n
+        FROM DailyAssignments da JOIN Rowers r ON r.rower_id = da.rower_id
+        GROUP BY da.event_date, r.gender, da.location
+    """)
+
+
+@st.cache_data(ttl=120)
+def load_daily_assignments_view(date_str):
+    return run_query("""
+        SELECT r.rower_name, r.gender, da.location, da.is_coxswain
+        FROM DailyAssignments da JOIN Rowers r ON r.rower_id = da.rower_id
+        WHERE da.event_date = ?
+    """, (date_str,))
+
+
+@st.cache_data(ttl=120)
+def load_daily_coaches_view(date_str):
+    return run_query("SELECT location, coach_name FROM DailyCoaches WHERE event_date = ?", (date_str,))
+
+
 def render_month_calendar(events_by_date, year, month, key_prefix):
     nav1, nav2, nav3, nav4 = st.columns([1, 1, 3, 1])
     if nav1.button("◀ Prev", key=f"{key_prefix}_prev"):
@@ -227,21 +260,33 @@ with tab_calendar:
         st.session_state["cal_month"] = pd.Timestamp.now().month
 
     practice_events_df = load_events()
-    signup_events_df_cal = run_query("SELECT event_date, title FROM SignUpEvents")
-    regattas_cal_df = run_query("SELECT name, event_date FROM Regattas WHERE event_date IS NOT NULL")
+    signup_events_df_cal = load_signup_events_cal()
+    regattas_cal_df = load_regattas_cal()
 
     type_colors = {"water": "#2E7D9A", "erg": "#B8925A", "off": "#8A8177"}
+    gender_icon = {"men": "♂", "women": "♀"}
     events_by_date = {}
+
+    gendered_df = load_gendered_assignments_by_date()
+    dates_with_assignments = set(gendered_df["event_date"].tolist())
+
     for _, r in practice_events_df.iterrows():
+        if r["event_date"] in dates_with_assignments:
+            continue
         label = {"water": "🚣 Water", "erg": "🏋️ Erg", "off": "❌ Off"}.get(r["event_type"], r["event_type"])
         events_by_date.setdefault(r["event_date"], []).append((label, type_colors.get(r["event_type"], "#500000")))
+    for _, row in gendered_df.iterrows():
+        loc_label = {"water": "Water", "land": "Land"}.get(row["location"], row["location"])
+        label = f"{gender_icon.get(row['gender'], row['gender'])} {loc_label}"
+        color = type_colors.get(row["location"] if row["location"] != "land" else "erg", "#500000")
+        events_by_date.setdefault(row["event_date"], []).append((label, color))
     for _, r in signup_events_df_cal.iterrows():
         events_by_date.setdefault(r["event_date"], []).append((f"📝 {r['title']}", "#7A5C8E"))
     for _, r in regattas_cal_df.iterrows():
         events_by_date.setdefault(r["event_date"], []).append((f"🏆 {r['name']}", "#500000"))
 
     render_month_calendar(events_by_date, st.session_state["cal_year"], st.session_state["cal_month"], "cal")
-    st.caption("🚣 Water · 🏋️ Erg House · ❌ Off · 📝 Sign-up · 🏆 Regatta")
+    st.caption("🚣 Water · 🏋️ Erg/Land · ❌ Off · 📝 Sign-up · 🏆 Regatta · ♂ Men · ♀ Women")
 
 with tab_signups:
     st.title("Sign-Ups")
@@ -440,18 +485,31 @@ with tab_weekly:
     week_start2 = st.date_input("Week of", value=pd.Timestamp.now().date(), key="weekly_view_start")
     week_start2_dt = pd.Timestamp(week_start2)
     monday2 = week_start2_dt - pd.Timedelta(days=week_start2_dt.weekday())
-    weekdays2 = [monday2 + pd.Timedelta(days=i) for i in range(5)]
+    weekdays2 = [monday2 + pd.Timedelta(days=i) for i in range(6)]  # Mon-Sat
 
     st.info("Every day you're either not scheduled, on land (ergs), or on the water. If you're on the water, boat lineups get sorted out once everyone's at the lake.")
 
+    def render_location_group(container, group, label, coach_name):
+        container.markdown(f"**{label}** — Coach: {coach_name or '—'}")
+        if group.empty:
+            container.caption("Nobody assigned.")
+            return
+        men = group[group["gender"] == "men"].sort_values("rower_name")
+        women = group[group["gender"] == "women"].sort_values("rower_name")
+        mcol, wcol = container.columns(2)
+        mcol.caption("Men")
+        for _, r in men.iterrows():
+            cox_tag = " (cox)" if r["is_coxswain"] else ""
+            mcol.markdown(f"- {r['rower_name']}{cox_tag}")
+        wcol.caption("Women")
+        for _, r in women.iterrows():
+            cox_tag = " (cox)" if r["is_coxswain"] else ""
+            wcol.markdown(f"- {r['rower_name']}{cox_tag}")
+
     for day in weekdays2:
         date_str = str(day.date())
-        assignments_df = run_query("""
-            SELECT r.rower_name, r.gender, da.location, da.is_coxswain
-            FROM DailyAssignments da JOIN Rowers r ON r.rower_id = da.rower_id
-            WHERE da.event_date = ?
-        """, (date_str,))
-        coaches_df = run_query("SELECT location, coach_name FROM DailyCoaches WHERE event_date = ?", (date_str,))
+        assignments_df = load_daily_assignments_view(date_str)
+        coaches_df = load_daily_coaches_view(date_str)
         coach_map = dict(zip(coaches_df["location"], coaches_df["coach_name"]))
 
         with st.container(border=True):
@@ -461,21 +519,6 @@ with tab_weekly:
                 continue
 
             wc, lc = st.columns(2)
-            with wc:
-                water_group = assignments_df[assignments_df["location"] == "water"]
-                st.markdown(f"**🚣 Water** — Coach: {coach_map.get('water') or '—'}")
-                if water_group.empty:
-                    st.caption("Nobody assigned.")
-                else:
-                    for _, r in water_group.sort_values("rower_name").iterrows():
-                        cox_tag = " (cox)" if r["is_coxswain"] else ""
-                        st.markdown(f"- {r['rower_name']}{cox_tag}")
-            with lc:
-                land_group = assignments_df[assignments_df["location"] == "land"]
-                st.markdown(f"**🏋️ Land** — Coach: {coach_map.get('land') or '—'}")
-                if land_group.empty:
-                    st.caption("Nobody assigned.")
-                else:
-                    for _, r in land_group.sort_values("rower_name").iterrows():
-                        st.markdown(f"- {r['rower_name']}")
+            render_location_group(wc, assignments_df[assignments_df["location"] == "water"], "🚣 Water", coach_map.get("water"))
+            render_location_group(lc, assignments_df[assignments_df["location"] == "land"], "🏋️ Land", coach_map.get("land"))
 
