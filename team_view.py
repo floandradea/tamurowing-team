@@ -15,6 +15,40 @@ DB_PATH = "rowing_season_2026.db"
 
 st.set_page_config(page_title="TAMU Rowing — Team", layout="wide")
 
+# ---------------------------------------------------------------
+# Simple password gate — same pattern as the coach app. Keeps real names,
+# contact info, and lineups from being publicly viewable by anyone who
+# has (or finds) this URL, since this repo is public.
+# ---------------------------------------------------------------
+def check_password():
+    def password_entered():
+        try:
+            correct = st.session_state.get("password_input") == st.secrets.get("TEAM_PASSWORD")
+        except Exception:
+            correct = False
+        if correct:
+            st.session_state["password_correct"] = True
+            del st.session_state["password_input"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.text_input("Password", type="password", on_change=password_entered, key="password_input")
+    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+        st.error("Incorrect password.")
+    return False
+
+
+try:
+    has_team_password = "TEAM_PASSWORD" in st.secrets
+except Exception:
+    has_team_password = False
+
+if has_team_password and not check_password():
+    st.stop()
+
 st.markdown("""
 <style>
     .stApp { background-color: #FAF8F5; }
@@ -63,11 +97,69 @@ def run_write(sql, params=None):
     return cur.lastrowid
 
 
+def get_verified_identity(context_key):
+    """
+    Shared per-rower identity check used by any tab where a rower needs to be
+    'themselves' to act (Sign-Ups, Availability). Once verified, the choice
+    persists for the rest of the browser session across all tabs — no need
+    to re-enter a PIN every time.
+
+    Returns (rower_id, rower_name) once verified, or None while still
+    showing the pick-name/enter-PIN UI (caller should stop and not render
+    the rest of that tab yet).
+    """
+    roster_df = run_query("SELECT rower_id, rower_name, pin FROM Rowers ORDER BY rower_name")
+    if roster_df.empty:
+        st.info("No rowers on the roster yet.")
+        return None
+
+    if "verified_rower_id" in st.session_state:
+        vid = st.session_state["verified_rower_id"]
+        vrow = roster_df[roster_df["rower_id"] == vid]
+        if not vrow.empty:
+            vname = vrow["rower_name"].iloc[0]
+            c1, c2 = st.columns([4, 1])
+            c1.success(f"Signed in as **{vname}**")
+            if c2.button("Switch", key=f"switch_identity_{context_key}"):
+                del st.session_state["verified_rower_id"]
+                st.rerun()
+            return int(vid), vname
+
+    selected_name = st.selectbox("I am:", roster_df["rower_name"].tolist(), key=f"identity_select_{context_key}")
+    selected_row = roster_df[roster_df["rower_name"] == selected_name].iloc[0]
+    selected_id = int(selected_row["rower_id"])
+    has_pin = pd.notna(selected_row["pin"]) and selected_row["pin"]
+
+    if not has_pin:
+        st.info("First time here? Set a 4-digit PIN so only you can edit your own info.")
+        new_pin = st.text_input("Create a PIN", type="password", max_chars=4, key=f"newpin_{context_key}_{selected_id}")
+        confirm_pin = st.text_input("Confirm PIN", type="password", max_chars=4, key=f"confirmpin_{context_key}_{selected_id}")
+        if st.button("Set PIN & Continue", key=f"setpin_btn_{context_key}_{selected_id}"):
+            if not (new_pin.isdigit() and len(new_pin) == 4):
+                st.error("PIN must be exactly 4 digits.")
+            elif new_pin != confirm_pin:
+                st.error("PINs don't match.")
+            else:
+                run_write("UPDATE Rowers SET pin = ? WHERE rower_id = ?", (new_pin, selected_id))
+                st.session_state["verified_rower_id"] = selected_id
+                st.rerun()
+        return None
+    else:
+        entered_pin = st.text_input("Enter your PIN", type="password", max_chars=4, key=f"enterpin_{context_key}_{selected_id}")
+        if st.button("Continue", key=f"verifypin_btn_{context_key}_{selected_id}"):
+            if entered_pin == selected_row["pin"]:
+                st.session_state["verified_rower_id"] = selected_id
+                st.rerun()
+            else:
+                st.error("Incorrect PIN.")
+        return None
+
+
 @st.cache_data(ttl=120)
 def load_roster():
     # Deliberately NOT selecting any of the coach-score columns or weight —
     # this view is meant to be safe to share with the whole team.
-    return run_query("SELECT rower_name, gender, experience_level, years_rowing FROM Rowers ORDER BY rower_name")
+    return run_query("SELECT rower_name, gender, experience_level, years_rowing, phone, email FROM Rowers ORDER BY rower_name")
 
 
 @st.cache_data(ttl=120)
@@ -198,6 +290,28 @@ tab_lineups, tab_roster, tab_announce, tab_calendar, tab_signups, tab_availabili
 
 with tab_lineups:
     st.title("Lineups")
+
+    st.subheader("This Week's Practice Lineups")
+    weekly_lineups_df = run_query("""
+        SELECT boat_name, race_date, seat_number, side, r.rower_name
+        FROM Lineups l JOIN Rowers r ON r.rower_id = l.rower_id
+        WHERE l.regatta_id IS NULL AND l.race_date IS NOT NULL AND l.is_visible_to_team = 1
+        ORDER BY race_date, boat_name, seat_number
+    """)
+    if weekly_lineups_df.empty:
+        st.caption("No practice lineups posted yet.")
+    else:
+        for race_date, day_group in weekly_lineups_df.groupby("race_date", sort=True):
+            day_label = pd.Timestamp(race_date).strftime("%A, %B %-d") if hasattr(pd.Timestamp(race_date), "strftime") else race_date
+            with st.expander(f"{day_label} ({day_group['boat_name'].nunique()} boat(s))"):
+                for boat_name, group in day_group.groupby("boat_name", sort=True):
+                    st.markdown(f"**{boat_name}**")
+                    display = group.sort_values("seat_number")[["seat_number", "side", "rower_name"]]
+                    display.columns = ["Seat", "Side", "Rower"]
+                    st.dataframe(display, width='stretch', hide_index=True)
+
+    st.divider()
+    st.subheader("Regatta Lineups")
     st.caption("Click a regatta to see its lineups.")
 
     regattas_df = load_regattas()
@@ -221,7 +335,7 @@ with tab_lineups:
                     display.columns = ["Seat", "Side", "Rower"]
                     st.dataframe(display, width='stretch', hide_index=True)
         if not any_shown:
-            st.info("No lineups posted yet for this season.")
+            st.info("No regatta lineups posted yet for this season.")
 
 with tab_roster:
     st.title("Roster")
@@ -229,6 +343,14 @@ with tab_roster:
     if roster_df.empty:
         st.info("No rowers on the roster yet.")
     else:
+        def contact_line(r):
+            parts = []
+            if pd.notna(r.get("phone")) and r.get("phone"):
+                parts.append(f"📞 {r['phone']}")
+            if pd.notna(r.get("email")) and r.get("email"):
+                parts.append(f"✉️ {r['email']}")
+            return " · ".join(parts)
+
         col_w, col_m = st.columns(2)
         women = roster_df[roster_df["gender"] == "women"]
         men = roster_df[roster_df["gender"] == "men"]
@@ -236,10 +358,16 @@ with tab_roster:
             st.subheader(f"Women ({len(women)})")
             for _, r in women.iterrows():
                 st.markdown(f"**{r['rower_name']}** — {r['experience_level']}, {r['years_rowing']} yr(s)")
+                contact = contact_line(r)
+                if contact:
+                    st.caption(contact)
         with col_m:
             st.subheader(f"Men ({len(men)})")
             for _, r in men.iterrows():
                 st.markdown(f"**{r['rower_name']}** — {r['experience_level']}, {r['years_rowing']} yr(s)")
+                contact = contact_line(r)
+                if contact:
+                    st.caption(contact)
 
 with tab_announce:
     st.title("Announcements")
@@ -290,14 +418,11 @@ with tab_calendar:
 
 with tab_signups:
     st.title("Sign-Ups")
-    st.caption("Pick your name once, then sign up for a specific time slot below.")
+    st.caption("Sign up for a specific time slot below.")
 
-    roster_names_df = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
-    if roster_names_df.empty:
-        st.info("No rowers on the roster yet.")
-    else:
-        my_name = st.selectbox("I am:", roster_names_df["rower_name"].tolist())
-        my_id = int(roster_names_df[roster_names_df["rower_name"] == my_name]["rower_id"].iloc[0])
+    identity = get_verified_identity("signups")
+    if identity is not None:
+        my_id, my_name = identity
 
         events_df = run_query("SELECT * FROM SignUpEvents ORDER BY event_date ASC")
         today_str = str(pd.Timestamp.now().date())
@@ -361,12 +486,9 @@ with tab_availability:
     st.title("Availability")
     st.caption("Practice is assumed every day except Sunday, unless coaches say otherwise. Click a day to mark yourself out, add a reason, then save. Days too close are locked so coaches aren't surprised last-minute.")
 
-    roster_names_df2 = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
-    if roster_names_df2.empty:
-        st.info("No rowers on the roster yet.")
-    else:
-        my_name2 = st.selectbox("I am:", roster_names_df2["rower_name"].tolist(), key="avail_my_name")
-        my_id2 = int(roster_names_df2[roster_names_df2["rower_name"] == my_name2]["rower_id"].iloc[0])
+    identity2 = get_verified_identity("availability")
+    if identity2 is not None:
+        my_id2, my_name2 = identity2
 
         settings_df2 = run_query("SELECT * FROM AttendanceSettings LIMIT 1")
         deadline_days = int(settings_df2["days_before_deadline"].iloc[0]) if not settings_df2.empty else 1
@@ -477,6 +599,7 @@ with tab_availability:
                             run_write("DELETE FROM DayAbsences WHERE rower_id = ? AND event_date = ?", (my_id2, date_str))
                 st.toast("Saved.", icon="💾")
                 st.rerun()
+
 
 with tab_weekly:
     st.title("Weekly Schedule")
