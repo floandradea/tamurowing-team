@@ -37,9 +37,27 @@ def check_password():
     if st.session_state.get("password_correct", False):
         return True
 
-    st.text_input("Password", type="password", on_change=password_entered, key="password_input")
-    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
-        st.error("Incorrect password.")
+    st.markdown("""
+    <style>
+        [data-testid="stTextInput"] input {
+            border: 2px solid #500000 !important;
+            border-radius: 8px !important;
+            text-align: center;
+            padding: 10px !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    lc1, lc2, lc3 = st.columns([1, 1.1, 1])
+    with lc2:
+        st.markdown(
+            "<h2 style='text-align:center; color:#500000; font-family:Georgia,serif; margin-top:60px; margin-bottom:2px;'>🚣 TAMU Rowing</h2>"
+            "<p style='text-align:center; color:#8A8177; font-size:13px; margin-bottom:18px;'>Enter the password to continue</p>",
+            unsafe_allow_html=True,
+        )
+        st.text_input("Password", type="password", on_change=password_entered, key="password_input", label_visibility="collapsed", placeholder="Password")
+        if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+            st.error("Incorrect password.")
     return False
 
 
@@ -131,8 +149,8 @@ if season_choice is None:
 season = "2k" if "2k" in season_choice else "5k"
 st.caption(f"Applies to Overview, Lineup Builder, Regatta Lineups, and the split shown on Rower Profile — Team Roster stays season-independent.")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Overview", "Team Roster", "Rower Profile", "Lineup Builder", "Regatta Lineups", "Team & Calendar", "Weekly Schedule"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+    ["Overview", "Team Roster", "Rower Profile", "Lineup Builder", "Regatta Lineups", "Team & Calendar", "Weekly Schedule", "Weekly Lineups"]
 )
 
 # ---------------------------------------------------------------
@@ -641,6 +659,10 @@ with tab2:
         new_side = nc8.selectbox("Side preference", ["port", "starboard", "both"], key="new_rower_side")
         new_height = new_height_ft * 12 + new_height_in
 
+        nc9, nc10 = st.columns(2)
+        new_phone = nc9.text_input("Phone (optional)", key="new_rower_phone")
+        new_email = nc10.text_input("Email (optional)", key="new_rower_email")
+
         add_clicked = st.button("Add Rower", type="primary")
 
         if add_clicked:
@@ -654,13 +676,15 @@ with tab2:
                 score_placeholders = ", ".join(["?"] * len(SCORE_FIELDS))
                 score_defaults = [70] * len(SCORE_FIELDS)  # neutral default — matches what the app already assumes for unrated rowers
                 run_write(
-                    f"INSERT INTO Rowers (rower_name, gender, weight, years_rowing, experience_level, height_in, sweep_side, {score_cols}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, {score_placeholders})",
-                    (clean_name, new_gender, new_weight, new_years, new_exp, new_height, new_side, *score_defaults),
+                    f"INSERT INTO Rowers (rower_name, gender, weight, years_rowing, experience_level, height_in, sweep_side, phone, email, {score_cols}) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {score_placeholders})",
+                    (clean_name, new_gender, new_weight, new_years, new_exp, new_height, new_side,
+                     new_phone.strip() or None, new_email.strip() or None, *score_defaults),
                 )
                 st.session_state["add_rower_expanded"] = True
                 for k in ["new_rower_name", "new_rower_gender", "new_rower_weight", "new_rower_years",
-                          "new_rower_exp", "new_rower_height_ft", "new_rower_height_in", "new_rower_side"]:
+                          "new_rower_exp", "new_rower_height_ft", "new_rower_height_in", "new_rower_side",
+                          "new_rower_phone", "new_rower_email"]:
                     st.session_state.pop(k, None)
                 st.toast(f"Added {clean_name}.", icon="✅")
                 st.rerun()
@@ -693,6 +717,11 @@ with tab2:
 
                 is_cox = st.checkbox("🎯 This rower is a coxswain", value=bool(r.get("is_coxswain")), key=f"cox_{rid}")
 
+                st.markdown("**Contact**")
+                ct1, ct2 = st.columns(2)
+                phone = ct1.text_input("Phone", value=r.get("phone") or "", key=f"phone_{rid}")
+                email = ct2.text_input("Email", value=r.get("email") or "", key=f"email_{rid}")
+
                 st.markdown("**Coach Scores** (0–100)")
                 score_pairs = [SCORE_FIELDS[i:i + 2] for i in range(0, len(SCORE_FIELDS), 2)]
                 score_values = {}
@@ -708,7 +737,8 @@ with tab2:
 
                 if st.button("💾 Save", key=f"save_rower_{rid}"):
                     all_fields = {"weight": weight, "height_in": height, "years_rowing": years,
-                                   "experience_level": exp, "sweep_side": side, "is_coxswain": 1 if is_cox else 0, **score_values}
+                                   "experience_level": exp, "sweep_side": side, "is_coxswain": 1 if is_cox else 0,
+                                   "phone": phone.strip() or None, "email": email.strip() or None, **score_values}
                     set_clause = ", ".join([f"{c} = ?" for c in all_fields])
                     run_write(f"UPDATE Rowers SET {set_clause} WHERE rower_id = ?", list(all_fields.values()) + [rid])
                     st.toast(f"Saved {r['rower_name']}.", icon="✅")
@@ -1763,3 +1793,104 @@ with tab7:
                            (date_str, land_coach.strip() or None))
                 st.toast(f"Saved {day.strftime('%A')}.", icon="💾")
                 st.rerun()
+
+with tab8:
+    st.title("Weekly Lineups")
+    st.caption("Build actual boat lineups for regular practice days — Monday practice, Tuesday practice, etc. Update this every weekend; rowers see it on the team site. Unlike Lineup Builder, these aren't tied to a regatta.")
+
+    if "pending_wl_swap" in st.session_state:
+        swap = st.session_state.pop("pending_wl_swap")
+        for seat_num, name in swap["seats"].items():
+            st.session_state[f"wl_seat_{swap['key']}_{seat_num}"] = name if name else "— empty —"
+
+    wl_week_start = st.date_input("Pick any date in the week you're building lineups for", value=pd.Timestamp.now().date(), key="wl_week_start")
+    wl_week_start_dt = pd.Timestamp(wl_week_start)
+    wl_monday = wl_week_start_dt - pd.Timedelta(days=wl_week_start_dt.weekday())
+    wl_weekdays = [wl_monday + pd.Timedelta(days=i) for i in range(6)]  # Mon-Sat
+
+    for day in wl_weekdays:
+        date_str = str(day.date())
+        with st.expander(f"{day.strftime('%A')} — {date_str}", expanded=False):
+            wc1, wc2, wc3, wc4 = st.columns(4)
+            wl_squad = wc1.selectbox("Squad", ["women", "men"], key=f"wl_squad_{date_str}")
+            wl_category = wc2.selectbox("Category", ["varsity", "novice"], key=f"wl_category_{date_str}")
+            wl_boat_class = wc3.selectbox("Boat class", list(BOAT_SEAT_MAP.keys()), key=f"wl_class_{date_str}")
+            wl_label = wc4.text_input("Boat label", value="A", key=f"wl_label_{date_str}", help="Use B, C, etc. for a second boat of the same class on the same day.")
+
+            boat_name = f"{wl_squad.title()} {wl_category.title()} {wl_boat_class} {wl_label}"
+            combo_key = f"{date_str}_{wl_squad}_{wl_category}_{wl_boat_class}_{wl_label}"
+
+            weight_cap = 160 if wl_squad == "men" else 130
+            pool = rowers_df[rowers_df["gender"] == wl_squad].copy()
+            if wl_category == "novice":
+                pool = pool[pool["experience_level"] == "novice"]
+            split_field = "time_2k_sec" if season == "2k" else "time_5k_sec"
+            sort_date_field = "test_date_2k" if season == "2k" else "test_date_5k"
+            latest_wl = erg_df.sort_values(sort_date_field).groupby("rower_id").last().reset_index()
+            season_erg_wl = latest_wl[["rower_id", split_field, "max_watts"]].rename(columns={split_field: "time_2k_sec"})
+            pool = pool.merge(season_erg_wl, on="rower_id", how="left")
+
+            seat_map = BOAT_SEAT_MAP[wl_boat_class]
+            is_sweep = wl_boat_class in SWEEP_CLASSES
+
+            existing_lineup_df = run_query(
+                "SELECT seat_number, side, rower_id FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?",
+                (date_str, boat_name),
+            )
+            id_to_name_wl = dict(zip(rowers_df["rower_id"], rowers_df["rower_name"])) if not rowers_df.empty else {}
+            existing_seats_wl = {int(row["seat_number"]): id_to_name_wl.get(row["rower_id"]) for _, row in existing_lineup_df.iterrows()}
+            existing_sides_wl = {int(row["seat_number"]): row["side"] for _, row in existing_lineup_df.iterrows()}
+
+            if st.button("🪄 Auto-fill", key=f"wl_autofill_{combo_key}"):
+                if len(pool):
+                    suggestion = auto_assign_boat(pool, seat_map, already_taken={})
+                    st.session_state["pending_wl_swap"] = {"key": combo_key, "seats": suggestion}
+                    if is_sweep:
+                        for seat_num in sorted(seat_map.keys()):
+                            st.session_state[f"wl_side_{combo_key}_{seat_num}"] = "port" if seat_num % 2 == 1 else "starboard"
+                    st.rerun()
+                else:
+                    st.warning("No eligible rowers with erg scores for this filter yet.")
+
+            seats_now = {}
+            sides_now = {}
+            for seat_num, role in seat_map.items():
+                fit_scores = compute_fit(pool, role) if len(pool) else pd.Series(dtype=float)
+                pool_ranked = pool.assign(fit=fit_scores).sort_values("fit", ascending=False) if len(pool) else pool
+                options = ["— empty —"] + pool_ranked["rower_name"].tolist()
+                current_val = existing_seats_wl.get(seat_num, "— empty —") or "— empty —"
+                if current_val not in options:
+                    options = options + [current_val]
+
+                cols = st.columns([0.6, 1.4, 2.2, 1, 1.2]) if is_sweep else st.columns([0.6, 1.4, 2.6, 1.4])
+                cols[0].markdown(f"**Seat {seat_num}**")
+                cols[1].markdown(f"*{role}*")
+                chosen = cols[2].selectbox("Rower", options, index=options.index(current_val),
+                                            key=f"wl_seat_{combo_key}_{seat_num}", label_visibility="collapsed")
+                seats_now[seat_num] = None if chosen == "— empty —" else chosen
+                if chosen != "— empty —":
+                    fit_row = pool_ranked[pool_ranked["rower_name"] == chosen]
+                    fit_val = fit_row["fit"].iloc[0] if len(fit_row) else None
+                    cols[3].markdown(f"Fit: **{fit_val:.1f}**" if fit_val is not None else "Fit: —")
+                if is_sweep:
+                    side_default = existing_sides_wl.get(seat_num, "")
+                    side_val = cols[4].selectbox("Side", ["", "port", "starboard"],
+                                                  index=["", "port", "starboard"].index(side_default) if side_default in ["", "port", "starboard"] else 0,
+                                                  key=f"wl_side_{combo_key}_{seat_num}", label_visibility="collapsed")
+                    sides_now[seat_num] = side_val
+
+            if st.button(f"💾 Save {boat_name}", key=f"wl_save_{combo_key}"):
+                run_write("DELETE FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?", (date_str, boat_name))
+                name_to_id_wl = dict(zip(rowers_df["rower_name"], rowers_df["rower_id"])) if not rowers_df.empty else {}
+                saved = 0
+                for seat_num, rower_name in seats_now.items():
+                    if not rower_name:
+                        continue
+                    run_write(
+                        "INSERT INTO Lineups (boat_name, race_date, seat_number, side, rower_id, regatta_id, is_visible_to_team) VALUES (?, ?, ?, ?, ?, NULL, 1)",
+                        (boat_name, date_str, seat_num, sides_now.get(seat_num, ""), int(name_to_id_wl[rower_name])),
+                    )
+                    saved += 1
+                st.toast(f"Saved {saved} seat(s) for {boat_name}.", icon="💾")
+                st.rerun()
+

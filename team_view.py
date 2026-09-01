@@ -35,9 +35,27 @@ def check_password():
     if st.session_state.get("password_correct", False):
         return True
 
-    st.text_input("Password", type="password", on_change=password_entered, key="password_input")
-    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
-        st.error("Incorrect password.")
+    st.markdown("""
+    <style>
+        [data-testid="stTextInput"] input {
+            border: 2px solid #500000 !important;
+            border-radius: 8px !important;
+            text-align: center;
+            padding: 10px !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    lc1, lc2, lc3 = st.columns([1, 1.1, 1])
+    with lc2:
+        st.markdown(
+            "<h2 style='text-align:center; color:#500000; font-family:Georgia,serif; margin-top:60px; margin-bottom:2px;'>🚣 TAMU Rowing — Team</h2>"
+            "<p style='text-align:center; color:#8A8177; font-size:13px; margin-bottom:18px;'>Enter the password to continue</p>",
+            unsafe_allow_html=True,
+        )
+        st.text_input("Password", type="password", on_change=password_entered, key="password_input", label_visibility="collapsed", placeholder="Password")
+        if "password_correct" in st.session_state and not st.session_state["password_correct"]:
+            st.error("Incorrect password.")
     return False
 
 
@@ -95,64 +113,6 @@ def run_write(sql, params=None):
     conn.commit()
     st.cache_data.clear()
     return cur.lastrowid
-
-
-def get_verified_identity(context_key):
-    """
-    Shared per-rower identity check used by any tab where a rower needs to be
-    'themselves' to act (Sign-Ups, Availability). Once verified, the choice
-    persists for the rest of the browser session across all tabs — no need
-    to re-enter a PIN every time.
-
-    Returns (rower_id, rower_name) once verified, or None while still
-    showing the pick-name/enter-PIN UI (caller should stop and not render
-    the rest of that tab yet).
-    """
-    roster_df = run_query("SELECT rower_id, rower_name, pin FROM Rowers ORDER BY rower_name")
-    if roster_df.empty:
-        st.info("No rowers on the roster yet.")
-        return None
-
-    if "verified_rower_id" in st.session_state:
-        vid = st.session_state["verified_rower_id"]
-        vrow = roster_df[roster_df["rower_id"] == vid]
-        if not vrow.empty:
-            vname = vrow["rower_name"].iloc[0]
-            c1, c2 = st.columns([4, 1])
-            c1.success(f"Signed in as **{vname}**")
-            if c2.button("Switch", key=f"switch_identity_{context_key}"):
-                del st.session_state["verified_rower_id"]
-                st.rerun()
-            return int(vid), vname
-
-    selected_name = st.selectbox("I am:", roster_df["rower_name"].tolist(), key=f"identity_select_{context_key}")
-    selected_row = roster_df[roster_df["rower_name"] == selected_name].iloc[0]
-    selected_id = int(selected_row["rower_id"])
-    has_pin = pd.notna(selected_row["pin"]) and selected_row["pin"]
-
-    if not has_pin:
-        st.info("First time here? Set a 4-digit PIN so only you can edit your own info.")
-        new_pin = st.text_input("Create a PIN", type="password", max_chars=4, key=f"newpin_{context_key}_{selected_id}")
-        confirm_pin = st.text_input("Confirm PIN", type="password", max_chars=4, key=f"confirmpin_{context_key}_{selected_id}")
-        if st.button("Set PIN & Continue", key=f"setpin_btn_{context_key}_{selected_id}"):
-            if not (new_pin.isdigit() and len(new_pin) == 4):
-                st.error("PIN must be exactly 4 digits.")
-            elif new_pin != confirm_pin:
-                st.error("PINs don't match.")
-            else:
-                run_write("UPDATE Rowers SET pin = ? WHERE rower_id = ?", (new_pin, selected_id))
-                st.session_state["verified_rower_id"] = selected_id
-                st.rerun()
-        return None
-    else:
-        entered_pin = st.text_input("Enter your PIN", type="password", max_chars=4, key=f"enterpin_{context_key}_{selected_id}")
-        if st.button("Continue", key=f"verifypin_btn_{context_key}_{selected_id}"):
-            if entered_pin == selected_row["pin"]:
-                st.session_state["verified_rower_id"] = selected_id
-                st.rerun()
-            else:
-                st.error("Incorrect PIN.")
-        return None
 
 
 @st.cache_data(ttl=120)
@@ -418,11 +378,14 @@ with tab_calendar:
 
 with tab_signups:
     st.title("Sign-Ups")
-    st.caption("Sign up for a specific time slot below.")
+    st.caption("Pick your name once, then sign up for a specific time slot below.")
 
-    identity = get_verified_identity("signups")
-    if identity is not None:
-        my_id, my_name = identity
+    roster_names_df = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
+    if roster_names_df.empty:
+        st.info("No rowers on the roster yet.")
+    else:
+        my_name = st.selectbox("I am:", roster_names_df["rower_name"].tolist(), key="signups_my_name")
+        my_id = int(roster_names_df[roster_names_df["rower_name"] == my_name]["rower_id"].iloc[0])
 
         events_df = run_query("SELECT * FROM SignUpEvents ORDER BY event_date ASC")
         today_str = str(pd.Timestamp.now().date())
@@ -486,9 +449,12 @@ with tab_availability:
     st.title("Availability")
     st.caption("Practice is assumed every day except Sunday, unless coaches say otherwise. Click a day to mark yourself out, add a reason, then save. Days too close are locked so coaches aren't surprised last-minute.")
 
-    identity2 = get_verified_identity("availability")
-    if identity2 is not None:
-        my_id2, my_name2 = identity2
+    roster_names_df2 = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
+    if roster_names_df2.empty:
+        st.info("No rowers on the roster yet.")
+    else:
+        my_name2 = st.selectbox("I am:", roster_names_df2["rower_name"].tolist(), key="avail_my_name")
+        my_id2 = int(roster_names_df2[roster_names_df2["rower_name"] == my_name2]["rower_id"].iloc[0])
 
         settings_df2 = run_query("SELECT * FROM AttendanceSettings LIMIT 1")
         deadline_days = int(settings_df2["days_before_deadline"].iloc[0]) if not settings_df2.empty else 1
