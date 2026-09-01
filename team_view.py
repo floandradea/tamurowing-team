@@ -136,10 +136,11 @@ def load_regattas():
 @st.cache_data(ttl=120)
 def load_lineups():
     return run_query("""
-        SELECT l.boat_name, l.seat_number, l.side, r.rower_name, reg.name AS regatta
+        SELECT l.boat_name, l.seat_number, l.side, r.rower_name, reg.name AS regatta, eq.name AS boat_used
         FROM Lineups l
         JOIN Rowers r ON r.rower_id = l.rower_id
         LEFT JOIN Regattas reg ON reg.regatta_id = l.regatta_id
+        LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
         WHERE l.is_visible_to_team = 1
         ORDER BY reg.name, l.boat_name, l.seat_number
     """)
@@ -253,8 +254,9 @@ with tab_lineups:
 
     st.subheader("This Week's Practice Lineups")
     weekly_lineups_df = run_query("""
-        SELECT boat_name, race_date, seat_number, side, r.rower_name
+        SELECT boat_name, race_date, seat_number, side, r.rower_name, eq.name AS boat_used
         FROM Lineups l JOIN Rowers r ON r.rower_id = l.rower_id
+        LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
         WHERE l.regatta_id IS NULL AND l.race_date IS NOT NULL AND l.is_visible_to_team = 1
         ORDER BY race_date, boat_name, seat_number
     """)
@@ -266,6 +268,9 @@ with tab_lineups:
             with st.expander(f"{day_label} ({day_group['boat_name'].nunique()} boat(s))"):
                 for boat_name, group in day_group.groupby("boat_name", sort=True):
                     st.markdown(f"**{boat_name}**")
+                    boat_used = group["boat_used"].iloc[0]
+                    if pd.notna(boat_used) and boat_used:
+                        st.caption(f"🚣 Boat: {boat_used}")
                     display = group.sort_values("seat_number")[["seat_number", "side", "rower_name"]]
                     display.columns = ["Seat", "Side", "Rower"]
                     st.dataframe(display, width='stretch', hide_index=True)
@@ -291,6 +296,9 @@ with tab_lineups:
             with st.expander(f"{reg['name']} ({this_regatta['boat_name'].nunique()} boat(s))"):
                 for boat_name, group in this_regatta.groupby("boat_name", sort=True):
                     st.markdown(f"**{boat_name}**")
+                    boat_used = group["boat_used"].iloc[0] if "boat_used" in group.columns else None
+                    if pd.notna(boat_used) and boat_used:
+                        st.caption(f"🚣 Boat: {boat_used}")
                     display = group.sort_values("seat_number")[["seat_number", "side", "rower_name"]]
                     display.columns = ["Seat", "Side", "Rower"]
                     st.dataframe(display, width='stretch', hide_index=True)

@@ -149,8 +149,8 @@ if season_choice is None:
 season = "2k" if "2k" in season_choice else "5k"
 st.caption(f"Applies to Overview, Lineup Builder, Regatta Lineups, and the split shown on Rower Profile — Team Roster stays season-independent.")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-    ["Overview", "Team Roster", "Rower Profile", "Lineup Builder", "Regatta Lineups", "Team & Calendar", "Weekly Schedule", "Weekly Lineups"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+    ["Overview", "Team Roster", "Rower Profile", "Lineup Builder", "Regatta Lineups", "Team & Calendar", "Weekly Schedule", "Weekly Lineups", "Equipment"]
 )
 
 # ---------------------------------------------------------------
@@ -470,10 +470,11 @@ def load_unavailable_pairs():
 @st.cache_data(ttl=300)
 def load_lineups_filtered(regatta, boat_name_pattern):
     return run_query("""
-        SELECT l.boat_name, l.seat_number, l.side, r.rower_name, reg.name AS regatta, l.regatta_id AS regatta_id_raw, l.is_visible_to_team
+        SELECT l.boat_name, l.seat_number, l.side, r.rower_name, reg.name AS regatta, l.regatta_id AS regatta_id_raw, l.is_visible_to_team, eq.name AS boat_used
         FROM Lineups l
         JOIN Rowers r ON r.rower_id = l.rower_id
         LEFT JOIN Regattas reg ON reg.regatta_id = l.regatta_id
+        LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
         WHERE reg.name = ? AND l.boat_name LIKE ?
         ORDER BY l.boat_name, l.seat_number
     """, (regatta, boat_name_pattern))
@@ -482,10 +483,11 @@ def load_lineups_filtered(regatta, boat_name_pattern):
 @st.cache_data(ttl=300)
 def load_all_lineups():
     return run_query("""
-        SELECT l.boat_name, l.seat_number, l.side, r.rower_name, reg.name AS regatta, l.regatta_id AS regatta_id_raw, l.is_visible_to_team
+        SELECT l.boat_name, l.seat_number, l.side, r.rower_name, reg.name AS regatta, l.regatta_id AS regatta_id_raw, l.is_visible_to_team, eq.name AS boat_used
         FROM Lineups l
         JOIN Rowers r ON r.rower_id = l.rower_id
         LEFT JOIN Regattas reg ON reg.regatta_id = l.regatta_id
+        LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
         ORDER BY reg.name, l.boat_name, l.seat_number
     """)
 
@@ -571,6 +573,16 @@ def load_daily_assignments(date_str):
 @st.cache_data(ttl=300)
 def load_daily_coaches(date_str):
     return run_query("SELECT location, coach_name FROM DailyCoaches WHERE event_date = ?", (date_str,))
+
+
+@st.cache_data(ttl=300)
+def load_equipment():
+    return run_query("SELECT * FROM Equipment ORDER BY category, name")
+
+
+@st.cache_data(ttl=300)
+def load_purchase_requests():
+    return run_query("SELECT * FROM PurchaseRequests ORDER BY requested_date DESC")
 
 
 @st.cache_data(ttl=300)
@@ -1078,6 +1090,19 @@ with tab4:
                 st.warning("No eligible rowers with erg scores for this filter yet.")
                 continue
 
+            boats_available_lb = load_equipment()
+            boats_available_lb = boats_available_lb[boats_available_lb["category"] == "Boat"] if not boats_available_lb.empty else boats_available_lb
+            boat_option_names_lb = ["— not assigned —"] + boats_available_lb["name"].tolist() if not boats_available_lb.empty else ["— not assigned —"]
+            current_equipment_name = boat.get("equipment_name") or "— not assigned —"
+            if current_equipment_name not in boat_option_names_lb:
+                current_equipment_name = "— not assigned —"
+            selected_equipment_name = st.selectbox(
+                "🚣 Physical boat used (optional)", boat_option_names_lb,
+                index=boat_option_names_lb.index(current_equipment_name),
+                key=f"equipment_select_{boat['id']}",
+            )
+            boat["equipment_name"] = None if selected_equipment_name == "— not assigned —" else selected_equipment_name
+
             seat_map = BOAT_SEAT_MAP[boat["boat_class"]]
             is_sweep = boat["boat_class"] in SWEEP_CLASSES
 
@@ -1182,6 +1207,13 @@ with tab4:
                 regatta_row = regattas_df[regattas_df["name"] == regatta]
                 regatta_id = int(regatta_row["regatta_id"].iloc[0]) if not regatta_row.empty else None
                 boat_name = f"{squad.title()} {category.title()} {label}"
+
+                boat_equipment_id = None
+                if boat.get("equipment_name") and not boats_available_lb.empty:
+                    match = boats_available_lb[boats_available_lb["name"] == boat["equipment_name"]]
+                    if not match.empty:
+                        boat_equipment_id = int(match["equipment_id"].iloc[0])
+
                 # Clear any earlier saved rows for this exact boat first, so re-saving doesn't duplicate
                 run_write("DELETE FROM Lineups WHERE boat_name = ? AND regatta_id IS ?", (boat_name, regatta_id))
                 saved = 0
@@ -1191,8 +1223,8 @@ with tab4:
                     rower_id = int(rowers_df[rowers_df["rower_name"] == rower_name]["rower_id"].iloc[0])
                     side = boat["sides"].get(seat_num, "")
                     run_write(
-                        "INSERT INTO Lineups (boat_name, race_date, seat_number, side, rower_id, regatta_id) VALUES (?, ?, ?, ?, ?, ?)",
-                        (boat_name, None, seat_num, side, rower_id, regatta_id),
+                        "INSERT INTO Lineups (boat_name, race_date, seat_number, side, rower_id, regatta_id, equipment_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (boat_name, None, seat_num, side, rower_id, regatta_id, boat_equipment_id),
                     )
                     saved += 1
                 st.success(f"Saved {saved} seat(s) for {boat_name} to the database.")
@@ -1364,6 +1396,10 @@ with tab4:
                              if (regatta_name, row["rower_name"]) in unavailable_pairs]
                 if conflicts:
                     st.error(f"⚠ Marked unavailable for {regatta_name} but still in this lineup: {', '.join(sorted(set(conflicts)))}")
+
+                boat_used_name = boat_group["boat_used"].iloc[0] if "boat_used" in boat_group.columns else None
+                if pd.notna(boat_used_name) and boat_used_name:
+                    st.caption(f"🚣 Boat: {boat_used_name}")
 
                 display_df = boat_group[["seat_number", "side", "rower_name"]].copy()
                 display_df["⚠"] = display_df["rower_name"].apply(
@@ -1820,6 +1856,10 @@ with tab8:
             boat_name = f"{wl_squad.title()} {wl_category.title()} {wl_boat_class} {wl_label}"
             combo_key = f"{date_str}_{wl_squad}_{wl_category}_{wl_boat_class}_{wl_label}"
 
+            boats_available = load_equipment()
+            boats_available = boats_available[boats_available["category"] == "Boat"] if not boats_available.empty else boats_available
+            boat_option_names = ["— not assigned —"] + boats_available["name"].tolist() if not boats_available.empty else ["— not assigned —"]
+
             weight_cap = 160 if wl_squad == "men" else 130
             pool = rowers_df[rowers_df["gender"] == wl_squad].copy()
             if wl_category == "novice":
@@ -1834,12 +1874,24 @@ with tab8:
             is_sweep = wl_boat_class in SWEEP_CLASSES
 
             existing_lineup_df = run_query(
-                "SELECT seat_number, side, rower_id FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?",
+                "SELECT seat_number, side, rower_id, equipment_id FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?",
                 (date_str, boat_name),
             )
             id_to_name_wl = dict(zip(rowers_df["rower_id"], rowers_df["rower_name"])) if not rowers_df.empty else {}
             existing_seats_wl = {int(row["seat_number"]): id_to_name_wl.get(row["rower_id"]) for _, row in existing_lineup_df.iterrows()}
             existing_sides_wl = {int(row["seat_number"]): row["side"] for _, row in existing_lineup_df.iterrows()}
+            existing_equipment_id = int(existing_lineup_df["equipment_id"].iloc[0]) if len(existing_lineup_df) and pd.notna(existing_lineup_df["equipment_id"].iloc[0]) else None
+            existing_equipment_name = "— not assigned —"
+            if existing_equipment_id is not None and not boats_available.empty:
+                match = boats_available[boats_available["equipment_id"] == existing_equipment_id]
+                if not match.empty:
+                    existing_equipment_name = match["name"].iloc[0]
+
+            selected_boat_name = st.selectbox(
+                "🚣 Physical boat used (optional)", boat_option_names,
+                index=boat_option_names.index(existing_equipment_name) if existing_equipment_name in boat_option_names else 0,
+                key=f"wl_equipment_{combo_key}",
+            )
 
             if st.button("🪄 Auto-fill", key=f"wl_autofill_{combo_key}"):
                 if len(pool):
@@ -1880,6 +1932,12 @@ with tab8:
                     sides_now[seat_num] = side_val
 
             if st.button(f"💾 Save {boat_name}", key=f"wl_save_{combo_key}"):
+                selected_equipment_id = None
+                if selected_boat_name != "— not assigned —" and not boats_available.empty:
+                    match = boats_available[boats_available["name"] == selected_boat_name]
+                    if not match.empty:
+                        selected_equipment_id = int(match["equipment_id"].iloc[0])
+
                 run_write("DELETE FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?", (date_str, boat_name))
                 name_to_id_wl = dict(zip(rowers_df["rower_name"], rowers_df["rower_id"])) if not rowers_df.empty else {}
                 saved = 0
@@ -1887,10 +1945,127 @@ with tab8:
                     if not rower_name:
                         continue
                     run_write(
-                        "INSERT INTO Lineups (boat_name, race_date, seat_number, side, rower_id, regatta_id, is_visible_to_team) VALUES (?, ?, ?, ?, ?, NULL, 1)",
-                        (boat_name, date_str, seat_num, sides_now.get(seat_num, ""), int(name_to_id_wl[rower_name])),
+                        "INSERT INTO Lineups (boat_name, race_date, seat_number, side, rower_id, regatta_id, is_visible_to_team, equipment_id) VALUES (?, ?, ?, ?, ?, NULL, 1, ?)",
+                        (boat_name, date_str, seat_num, sides_now.get(seat_num, ""), int(name_to_id_wl[rower_name]), selected_equipment_id),
                     )
                     saved += 1
                 st.toast(f"Saved {saved} seat(s) for {boat_name}.", icon="💾")
                 st.rerun()
 
+with tab9:
+    st.title("Equipment")
+    st.caption("Track boats, oars, and gear — flag anything broken, and queue up purchase requests for the treasurer to see.")
+
+    CATEGORY_OPTIONS = ["Boat", "Oar", "Rigger", "Erg", "Safety Equipment", "Trailer", "Tools", "Uniform/Apparel", "Other"]
+    STATUS_OPTIONS = ["Good", "Needs Repair", "Broken", "Retired"]
+    STATUS_COLORS = {"Good": "🟢", "Needs Repair": "🟡", "Broken": "🔴", "Retired": "⚪"}
+
+    eq_tab1, eq_tab2 = st.tabs(["📦 Inventory", "🛒 Purchase Requests"])
+
+    with eq_tab1:
+        with st.expander("+ Add equipment"):
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            eq_name = ec1.text_input("Name", placeholder="e.g. Empacher 8+ #3", key="new_eq_name")
+            eq_category = ec2.selectbox("Category", CATEGORY_OPTIONS, key="new_eq_category")
+            eq_status = ec3.selectbox("Status", STATUS_OPTIONS, key="new_eq_status")
+            eq_qty = ec4.number_input("Quantity", min_value=1, step=1, value=1, key="new_eq_qty")
+            eq_notes = st.text_input("Notes (optional)", placeholder="e.g. bow seat cracked, needs new shoes", key="new_eq_notes")
+            if st.button("Add to Inventory", type="primary"):
+                if eq_name.strip():
+                    run_write(
+                        "INSERT INTO Equipment (name, category, status, quantity, notes, updated_date) VALUES (?, ?, ?, ?, ?, ?)",
+                        (eq_name.strip(), eq_category, eq_status, int(eq_qty), eq_notes.strip() or None, str(pd.Timestamp.now().date())),
+                    )
+                    for k in ["new_eq_name", "new_eq_category", "new_eq_status", "new_eq_qty", "new_eq_notes"]:
+                        st.session_state.pop(k, None)
+                    st.toast(f"Added {eq_name.strip()}.", icon="📦")
+                    st.rerun()
+                else:
+                    st.error("Give the item a name.")
+
+        equipment_df = load_equipment()
+        if equipment_df.empty:
+            st.info("No equipment logged yet — add your first item above.")
+        else:
+            fc1, fc2 = st.columns(2)
+            filter_category = fc1.selectbox("Filter by category", ["All"] + CATEGORY_OPTIONS, key="eq_filter_category")
+            filter_status = fc2.selectbox("Filter by status", ["All"] + STATUS_OPTIONS, key="eq_filter_status")
+
+            flagged = equipment_df[equipment_df["status"].isin(["Needs Repair", "Broken"])]
+            if not flagged.empty:
+                st.warning(f"⚠ {len(flagged)} item(s) need attention: " + ", ".join(f"{STATUS_COLORS[r['status']]} {r['name']}" for _, r in flagged.iterrows()))
+
+            shown = equipment_df.copy()
+            if filter_category != "All":
+                shown = shown[shown["category"] == filter_category]
+            if filter_status != "All":
+                shown = shown[shown["status"] == filter_status]
+
+            for _, item in shown.iterrows():
+                eid = int(item["equipment_id"])
+                with st.container(border=True):
+                    ic1, ic2, ic3 = st.columns([3, 1, 1])
+                    ic1.markdown(f"**{STATUS_COLORS.get(item['status'], '')} {item['name']}** — {item['category']} · qty {int(item['quantity'])}")
+                    new_status = ic2.selectbox("Status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(item["status"]), key=f"eq_status_{eid}", label_visibility="collapsed")
+                    if ic3.button("🗑 Remove", key=f"eq_del_{eid}"):
+                        run_write("DELETE FROM Equipment WHERE equipment_id = ?", (eid,))
+                        st.rerun()
+                    if pd.notna(item.get("notes")) and item.get("notes"):
+                        st.caption(item["notes"])
+                    if new_status != item["status"]:
+                        run_write("UPDATE Equipment SET status = ?, updated_date = ? WHERE equipment_id = ?",
+                                   (new_status, str(pd.Timestamp.now().date()), eid))
+                        st.toast(f"{item['name']} marked {new_status}.", icon="🔧")
+                        st.rerun()
+
+    with eq_tab2:
+        st.caption("Anything the team needs to buy — visible here for the treasurer too.")
+        with st.expander("+ Add a purchase request"):
+            pc1, pc2, pc3 = st.columns(3)
+            pr_item = pc1.text_input("Item needed", placeholder="e.g. New oar set (4x)", key="new_pr_item")
+            pr_cost = pc2.number_input("Estimated cost ($, optional)", min_value=0.0, step=10.0, key="new_pr_cost")
+            pr_priority = pc3.selectbox("Priority", ["Low", "Medium", "High"], index=1, key="new_pr_priority")
+            pr_reason = st.text_area("Reason", placeholder="Why is this needed?", key="new_pr_reason")
+            pr_by = st.text_input("Requested by", placeholder="Your name", key="new_pr_by")
+            if st.button("Submit Request", type="primary"):
+                if pr_item.strip():
+                    run_write(
+                        "INSERT INTO PurchaseRequests (item_name, reason, estimated_cost, priority, requested_by, requested_date) VALUES (?, ?, ?, ?, ?, ?)",
+                        (pr_item.strip(), pr_reason.strip() or None, pr_cost if pr_cost else None, pr_priority, pr_by.strip() or None, str(pd.Timestamp.now().date())),
+                    )
+                    for k in ["new_pr_item", "new_pr_cost", "new_pr_priority", "new_pr_reason", "new_pr_by"]:
+                        st.session_state.pop(k, None)
+                    st.toast(f"Requested {pr_item.strip()}.", icon="🛒")
+                    st.rerun()
+                else:
+                    st.error("Give the item a name.")
+
+        requests_df = load_purchase_requests()
+        if requests_df.empty:
+            st.info("No purchase requests yet.")
+        else:
+            priority_icon = {"High": "🔴 High", "Medium": "🟡 Medium", "Low": "🟢 Low"}
+            status_options_pr = ["Requested", "Approved", "Purchased", "Denied"]
+            for _, req in requests_df.iterrows():
+                rid = int(req["request_id"])
+                with st.container(border=True):
+                    rc1, rc2, rc3 = st.columns([3, 1.3, 1])
+                    cost_text = f" — ${req['estimated_cost']:.2f}" if pd.notna(req.get("estimated_cost")) else ""
+                    rc1.markdown(f"**{req['item_name']}**{cost_text} · {priority_icon.get(req['priority'], req['priority'])}")
+                    new_pr_status = rc2.selectbox("Status", status_options_pr, index=status_options_pr.index(req["status"]), key=f"pr_status_{rid}", label_visibility="collapsed")
+                    if rc3.button("🗑 Remove", key=f"pr_del_{rid}"):
+                        run_write("DELETE FROM PurchaseRequests WHERE request_id = ?", (rid,))
+                        st.rerun()
+                    meta = []
+                    if pd.notna(req.get("requested_by")) and req.get("requested_by"):
+                        meta.append(f"Requested by {req['requested_by']}")
+                    if pd.notna(req.get("requested_date")):
+                        meta.append(str(req["requested_date"]))
+                    if meta:
+                        st.caption(" · ".join(meta))
+                    if pd.notna(req.get("reason")) and req.get("reason"):
+                        st.caption(req["reason"])
+                    if new_pr_status != req["status"]:
+                        run_write("UPDATE PurchaseRequests SET status = ? WHERE request_id = ?", (new_pr_status, rid))
+                        st.toast(f"{req['item_name']} marked {new_pr_status}.", icon="🛒")
+                        st.rerun()
