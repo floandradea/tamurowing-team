@@ -149,8 +149,8 @@ if season_choice is None:
 season = "2k" if "2k" in season_choice else "5k"
 st.caption(f"Applies to Overview, Lineup Builder, Regatta Lineups, and the split shown on Rower Profile — Team Roster stays season-independent.")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
-    ["Overview", "Team Roster", "Rower Profile", "Lineup Builder", "Regatta Lineups", "Team & Calendar", "Weekly Schedule", "Weekly Lineups", "Equipment"]
+tab_overview, tab_roster, tab_profile, tab_weeklysched, tab_weeklylineups, tab_regatta, tab_calendar, tab_equipment, tab_builder = st.tabs(
+    ["Overview", "Team Roster", "Rower Profile", "Weekly Schedule", "Weekly Lineups", "Regatta Lineups", "Team & Calendar", "Equipment", "Lineup Builder"]
 )
 
 # ---------------------------------------------------------------
@@ -586,6 +586,14 @@ def load_purchase_requests():
 
 
 @st.cache_data(ttl=300)
+def load_weekly_lineup_seats(date_str, boat_name):
+    return run_query(
+        "SELECT seat_number, side, rower_id, equipment_id FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?",
+        (date_str, boat_name),
+    )
+
+
+@st.cache_data(ttl=300)
 def load_gendered_assignments_by_date():
     return run_query("""
         SELECT da.event_date, r.gender, da.location, COUNT(*) AS n
@@ -603,7 +611,7 @@ if rowers_df.empty:
 # =================================================================
 # PAGE: Overview
 # =================================================================
-with tab1:
+with tab_overview:
     st.title("Overview")
     st.caption(f"Showing {'Spring (2k)' if season == '2k' else 'Fall (5k)'} data — change the season selector above to switch.")
 
@@ -651,7 +659,7 @@ with tab1:
 # =================================================================
 # PAGE: Team Roster (editable — writes straight back to SQL)
 # =================================================================
-with tab2:
+with tab_roster:
     st.title("Team Roster")
     st.caption("Click a rower to expand and edit their info, grouped by what it means — physical stats, experience, and coach scores are kept separate.")
 
@@ -846,7 +854,7 @@ with tab2:
 # =================================================================
 # PAGE: Rower Profile
 # =================================================================
-with tab3:
+with tab_profile:
     st.title("Rower Profile")
 
     if rowers_df.empty:
@@ -879,7 +887,7 @@ with tab3:
 # =================================================================
 # PAGE: Lineup Builder
 # =================================================================
-with tab4:
+with tab_builder:
     st.title("Lineup Builder")
     st.caption("Boats you add here live in this browser session until you click Save — saving writes the lineup permanently to the database.")
 
@@ -1417,7 +1425,7 @@ with tab4:
         all_lineups_df = load_all_lineups()
         render_grouped_lineups(all_lineups_df, "all")
 
-with tab5:
+with tab_regatta:
     st.title("Regatta Lineups")
     st.caption("Pick a regatta to see every lineup saved for it, read-only — go to Lineup Builder to make changes.")
 
@@ -1539,7 +1547,7 @@ with tab5:
             show_squad_boats("women", "Women")
             show_squad_boats("men", "Men")
 
-with tab6:
+with tab_calendar:
     st.title("Team & Calendar")
     st.caption("Post announcements and manage the practice schedule — both show up on the rower-facing site.")
 
@@ -1766,7 +1774,7 @@ with tab6:
                 lines = "; ".join(f"{row['rower_name']} ({row['reason'] or 'no reason given'})" for _, row in group.iterrows())
                 st.markdown(f"**{event_date}** — {lines}")
 
-with tab7:
+with tab_weeklysched:
     st.title("Weekly Schedule")
     st.caption("Assign each rower to Water or Land per day, plus who's coaching each location. Update this every weekend for the coming week — it shows up on the rower-facing site automatically.")
 
@@ -1799,6 +1807,14 @@ with tab7:
             land_women = lm2.multiselect("Women", women_names, default=[n for n in existing_land if n in women_names], key=f"land_women_{date_str}")
             land_people = land_men + land_women
 
+            absences_df = load_absences()
+            absences_today = absences_df[absences_df["event_date"] == date_str]
+            absence_reasons = dict(zip(absences_today["rower_name"], absences_today["reason"]))
+            picked_but_absent = [n for n in (water_people + land_people) if n in absence_reasons]
+            if picked_but_absent:
+                lines = "; ".join(f"{n} ({absence_reasons[n] or 'no reason given'})" for n in picked_but_absent)
+                st.error(f"⚠ Marked absent for {date_str} but assigned above: {lines}")
+
             cox_names_from_profile = set(rowers_df[rowers_df["is_coxswain"] == 1]["rower_name"].tolist()) if not rowers_df.empty else set()
             cox_people = st.multiselect("Which of the water group are coxing?", water_people,
                                          default=[n for n in existing_cox if n in water_people], key=f"cox_{date_str}")
@@ -1830,7 +1846,7 @@ with tab7:
                 st.toast(f"Saved {day.strftime('%A')}.", icon="💾")
                 st.rerun()
 
-with tab8:
+with tab_weeklylineups:
     st.title("Weekly Lineups")
     st.caption("Build actual boat lineups for regular practice days — Monday practice, Tuesday practice, etc. Update this every weekend; rowers see it on the team site. Unlike Lineup Builder, these aren't tied to a regatta.")
 
@@ -1873,10 +1889,7 @@ with tab8:
             seat_map = BOAT_SEAT_MAP[wl_boat_class]
             is_sweep = wl_boat_class in SWEEP_CLASSES
 
-            existing_lineup_df = run_query(
-                "SELECT seat_number, side, rower_id, equipment_id FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?",
-                (date_str, boat_name),
-            )
+            existing_lineup_df = load_weekly_lineup_seats(date_str, boat_name)
             id_to_name_wl = dict(zip(rowers_df["rower_id"], rowers_df["rower_name"])) if not rowers_df.empty else {}
             existing_seats_wl = {int(row["seat_number"]): id_to_name_wl.get(row["rower_id"]) for _, row in existing_lineup_df.iterrows()}
             existing_sides_wl = {int(row["seat_number"]): row["side"] for _, row in existing_lineup_df.iterrows()}
@@ -1906,6 +1919,10 @@ with tab8:
 
             seats_now = {}
             sides_now = {}
+            absences_wl = load_absences()
+            absences_wl_today = absences_wl[absences_wl["event_date"] == date_str]
+            absence_reasons_wl = dict(zip(absences_wl_today["rower_name"], absences_wl_today["reason"]))
+
             for seat_num, role in seat_map.items():
                 fit_scores = compute_fit(pool, role) if len(pool) else pd.Series(dtype=float)
                 pool_ranked = pool.assign(fit=fit_scores).sort_values("fit", ascending=False) if len(pool) else pool
@@ -1931,6 +1948,11 @@ with tab8:
                                                   key=f"wl_side_{combo_key}_{seat_num}", label_visibility="collapsed")
                     sides_now[seat_num] = side_val
 
+            picked_but_absent_wl = [n for n in seats_now.values() if n and n in absence_reasons_wl]
+            if picked_but_absent_wl:
+                lines = "; ".join(f"{n} ({absence_reasons_wl[n] or 'no reason given'})" for n in picked_but_absent_wl)
+                st.error(f"⚠ Marked absent for {date_str} but seated above: {lines}")
+
             if st.button(f"💾 Save {boat_name}", key=f"wl_save_{combo_key}"):
                 selected_equipment_id = None
                 if selected_boat_name != "— not assigned —" and not boats_available.empty:
@@ -1952,43 +1974,56 @@ with tab8:
                 st.toast(f"Saved {saved} seat(s) for {boat_name}.", icon="💾")
                 st.rerun()
 
-with tab9:
+with tab_equipment:
     st.title("Equipment")
     st.caption("Track boats, oars, and gear — flag anything broken, and queue up purchase requests for the treasurer to see.")
 
-    CATEGORY_OPTIONS = ["Boat", "Oar", "Rigger", "Erg", "Safety Equipment", "Trailer", "Tools", "Uniform/Apparel", "Other"]
+    DEFAULT_CATEGORIES = ["Boat", "Oar", "Rigger", "Erg", "Safety Equipment", "Trailer", "Tools", "Uniform/Apparel"]
     STATUS_OPTIONS = ["Good", "Needs Repair", "Broken", "Retired"]
     STATUS_COLORS = {"Good": "🟢", "Needs Repair": "🟡", "Broken": "🔴", "Retired": "⚪"}
+
+    def category_picker(label, key_prefix, current_value=None):
+        """Lets a coach pick any category already in use, the built-in defaults, or type a brand new one."""
+        existing_cats = sorted(load_equipment()["category"].unique().tolist()) if not load_equipment().empty else []
+        all_known = sorted(set(DEFAULT_CATEGORIES) | set(existing_cats))
+        options = all_known + ["+ New category..."]
+        default_index = options.index(current_value) if current_value in options else 0
+        choice = st.selectbox(label, options, index=default_index, key=f"{key_prefix}_choice")
+        if choice == "+ New category...":
+            return st.text_input("New category name", value=current_value if current_value not in all_known else "", key=f"{key_prefix}_new")
+        return choice
 
     eq_tab1, eq_tab2 = st.tabs(["📦 Inventory", "🛒 Purchase Requests"])
 
     with eq_tab1:
         with st.expander("+ Add equipment"):
-            ec1, ec2, ec3, ec4 = st.columns(4)
+            ec1, ec2 = st.columns(2)
             eq_name = ec1.text_input("Name", placeholder="e.g. Empacher 8+ #3", key="new_eq_name")
-            eq_category = ec2.selectbox("Category", CATEGORY_OPTIONS, key="new_eq_category")
+            eq_category = category_picker("Category", "new_eq_category")
+            ec3, ec4 = st.columns(2)
             eq_status = ec3.selectbox("Status", STATUS_OPTIONS, key="new_eq_status")
             eq_qty = ec4.number_input("Quantity", min_value=1, step=1, value=1, key="new_eq_qty")
             eq_notes = st.text_input("Notes (optional)", placeholder="e.g. bow seat cracked, needs new shoes", key="new_eq_notes")
             if st.button("Add to Inventory", type="primary"):
-                if eq_name.strip():
+                if eq_name.strip() and eq_category.strip():
                     run_write(
                         "INSERT INTO Equipment (name, category, status, quantity, notes, updated_date) VALUES (?, ?, ?, ?, ?, ?)",
-                        (eq_name.strip(), eq_category, eq_status, int(eq_qty), eq_notes.strip() or None, str(pd.Timestamp.now().date())),
+                        (eq_name.strip(), eq_category.strip(), eq_status, int(eq_qty), eq_notes.strip() or None, str(pd.Timestamp.now().date())),
                     )
-                    for k in ["new_eq_name", "new_eq_category", "new_eq_status", "new_eq_qty", "new_eq_notes"]:
+                    for k in ["new_eq_name", "new_eq_category_choice", "new_eq_category_new", "new_eq_status", "new_eq_qty", "new_eq_notes"]:
                         st.session_state.pop(k, None)
                     st.toast(f"Added {eq_name.strip()}.", icon="📦")
                     st.rerun()
                 else:
-                    st.error("Give the item a name.")
+                    st.error("Give the item a name and a category.")
 
         equipment_df = load_equipment()
         if equipment_df.empty:
             st.info("No equipment logged yet — add your first item above.")
         else:
+            all_categories_in_use = sorted(equipment_df["category"].unique().tolist())
             fc1, fc2 = st.columns(2)
-            filter_category = fc1.selectbox("Filter by category", ["All"] + CATEGORY_OPTIONS, key="eq_filter_category")
+            filter_category = fc1.selectbox("Filter by category", ["All"] + all_categories_in_use, key="eq_filter_category")
             filter_status = fc2.selectbox("Filter by status", ["All"] + STATUS_OPTIONS, key="eq_filter_status")
 
             flagged = equipment_df[equipment_df["status"].isin(["Needs Repair", "Broken"])]
@@ -2004,19 +2039,39 @@ with tab9:
             for _, item in shown.iterrows():
                 eid = int(item["equipment_id"])
                 with st.container(border=True):
-                    ic1, ic2, ic3 = st.columns([3, 1, 1])
+                    ic1, ic2 = st.columns([4, 1])
                     ic1.markdown(f"**{STATUS_COLORS.get(item['status'], '')} {item['name']}** — {item['category']} · qty {int(item['quantity'])}")
-                    new_status = ic2.selectbox("Status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(item["status"]), key=f"eq_status_{eid}", label_visibility="collapsed")
-                    if ic3.button("🗑 Remove", key=f"eq_del_{eid}"):
-                        run_write("DELETE FROM Equipment WHERE equipment_id = ?", (eid,))
-                        st.rerun()
+                    quick_status = ic2.selectbox("Status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(item["status"]), key=f"eq_status_{eid}", label_visibility="collapsed")
                     if pd.notna(item.get("notes")) and item.get("notes"):
                         st.caption(item["notes"])
-                    if new_status != item["status"]:
+                    if quick_status != item["status"]:
                         run_write("UPDATE Equipment SET status = ?, updated_date = ? WHERE equipment_id = ?",
-                                   (new_status, str(pd.Timestamp.now().date()), eid))
-                        st.toast(f"{item['name']} marked {new_status}.", icon="🔧")
+                                   (quick_status, str(pd.Timestamp.now().date()), eid))
+                        st.toast(f"{item['name']} marked {quick_status}.", icon="🔧")
                         st.rerun()
+
+                    with st.expander("✏️ Edit"):
+                        edit_name = st.text_input("Name", value=item["name"], key=f"eq_edit_name_{eid}")
+                        edit_category = category_picker("Category", f"eq_edit_cat_{eid}", current_value=item["category"])
+                        edc1, edc2 = st.columns(2)
+                        edit_qty = edc1.number_input("Quantity", min_value=1, step=1, value=int(item["quantity"]), key=f"eq_edit_qty_{eid}")
+                        edit_status_full = edc2.selectbox("Status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(item["status"]), key=f"eq_edit_status_{eid}")
+                        edit_notes = st.text_input("Notes", value=item.get("notes") or "", key=f"eq_edit_notes_{eid}")
+                        esave, edel = st.columns(2)
+                        if esave.button("💾 Save changes", key=f"eq_save_{eid}"):
+                            if edit_name.strip() and edit_category.strip():
+                                run_write(
+                                    "UPDATE Equipment SET name = ?, category = ?, quantity = ?, status = ?, notes = ?, updated_date = ? WHERE equipment_id = ?",
+                                    (edit_name.strip(), edit_category.strip(), int(edit_qty), edit_status_full,
+                                     edit_notes.strip() or None, str(pd.Timestamp.now().date()), eid),
+                                )
+                                st.toast(f"Updated {edit_name.strip()}.", icon="✅")
+                                st.rerun()
+                            else:
+                                st.error("Name and category can't be empty.")
+                        if edel.button("🗑 Remove this item", key=f"eq_del_{eid}"):
+                            run_write("DELETE FROM Equipment WHERE equipment_id = ?", (eid,))
+                            st.rerun()
 
     with eq_tab2:
         st.caption("Anything the team needs to buy — visible here for the treasurer too.")

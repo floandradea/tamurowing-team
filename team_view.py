@@ -147,6 +147,60 @@ def load_lineups():
 
 
 @st.cache_data(ttl=120)
+def load_weekly_lineups_view():
+    return run_query("""
+        SELECT boat_name, race_date, seat_number, side, r.rower_name, eq.name AS boat_used
+        FROM Lineups l JOIN Rowers r ON r.rower_id = l.rower_id
+        LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
+        WHERE l.regatta_id IS NULL AND l.race_date IS NOT NULL AND l.is_visible_to_team = 1
+        ORDER BY race_date, boat_name, seat_number
+    """)
+
+
+@st.cache_data(ttl=120)
+def load_roster_names():
+    return run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
+
+
+@st.cache_data(ttl=120)
+def load_signup_events_view():
+    return run_query("SELECT * FROM SignUpEvents ORDER BY event_date ASC")
+
+
+@st.cache_data(ttl=120)
+def load_signup_slots_view(event_id):
+    return run_query("SELECT * FROM SignUpSlots WHERE event_id = ? ORDER BY start_time", (event_id,))
+
+
+@st.cache_data(ttl=120)
+def load_slot_responses_view(slot_id):
+    return run_query(
+        "SELECT r.rower_id, r.rower_name FROM SignUpResponses sr JOIN Rowers r ON r.rower_id = sr.rower_id WHERE sr.slot_id = ?",
+        (slot_id,),
+    )
+
+
+@st.cache_data(ttl=120)
+def load_attendance_settings_view():
+    return run_query("SELECT * FROM AttendanceSettings LIMIT 1")
+
+
+@st.cache_data(ttl=120)
+def load_practice_events_view():
+    return run_query("SELECT event_date, event_type FROM PracticeEvents")
+
+
+@st.cache_data(ttl=120)
+def load_regatta_dates_view():
+    return run_query("SELECT event_date, name FROM Regattas WHERE event_date IS NOT NULL")
+
+
+@st.cache_data(ttl=120)
+def load_my_absences(rower_id):
+    return run_query("SELECT event_date, reason FROM DayAbsences WHERE rower_id = ?", (rower_id,))
+
+
+@st.cache_data(ttl=120)
 def load_announcements():
     today_str = str(pd.Timestamp.now().date())
     return run_query(
@@ -245,21 +299,15 @@ if season_choice is None:
 season = "2k" if "2k" in season_choice else "5k"
 st.caption("Affects which regattas show under Lineups.")
 
-tab_lineups, tab_roster, tab_announce, tab_calendar, tab_signups, tab_availability, tab_weekly = st.tabs(
-    ["Lineups", "Roster", "Announcements", "Calendar", "Sign-Ups", "Availability", "Weekly Schedule"]
+tab_weekly, tab_lineups, tab_roster, tab_announce, tab_availability, tab_calendar, tab_signups = st.tabs(
+    ["Weekly Schedule", "Lineups", "Roster", "Announcements", "Availability", "Calendar", "Sign-Ups"]
 )
 
 with tab_lineups:
     st.title("Lineups")
 
     st.subheader("This Week's Practice Lineups")
-    weekly_lineups_df = run_query("""
-        SELECT boat_name, race_date, seat_number, side, r.rower_name, eq.name AS boat_used
-        FROM Lineups l JOIN Rowers r ON r.rower_id = l.rower_id
-        LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
-        WHERE l.regatta_id IS NULL AND l.race_date IS NOT NULL AND l.is_visible_to_team = 1
-        ORDER BY race_date, boat_name, seat_number
-    """)
+    weekly_lineups_df = load_weekly_lineups_view()
     if weekly_lineups_df.empty:
         st.caption("No practice lineups posted yet.")
     else:
@@ -388,14 +436,14 @@ with tab_signups:
     st.title("Sign-Ups")
     st.caption("Pick your name once, then sign up for a specific time slot below.")
 
-    roster_names_df = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
+    roster_names_df = load_roster_names()
     if roster_names_df.empty:
         st.info("No rowers on the roster yet.")
     else:
         my_name = st.selectbox("I am:", roster_names_df["rower_name"].tolist(), key="signups_my_name")
         my_id = int(roster_names_df[roster_names_df["rower_name"] == my_name]["rower_id"].iloc[0])
 
-        events_df = run_query("SELECT * FROM SignUpEvents ORDER BY event_date ASC")
+        events_df = load_signup_events_view()
         today_str = str(pd.Timestamp.now().date())
 
         if events_df.empty:
@@ -415,17 +463,14 @@ with tab_signups:
                     if deadline_passed:
                         st.caption("⚠ Sign-ups are closed for this event.")
 
-                    slots_df = run_query("SELECT * FROM SignUpSlots WHERE event_id = ? ORDER BY start_time", (eid,))
+                    slots_df = load_signup_slots_view(eid)
                     if slots_df.empty:
                         st.caption("No time slots posted for this yet.")
                         return
 
                     for _, slot in slots_df.iterrows():
                         sid = int(slot["slot_id"])
-                        responses_df = run_query(
-                            "SELECT r.rower_id, r.rower_name FROM SignUpResponses sr JOIN Rowers r ON r.rower_id = sr.rower_id WHERE sr.slot_id = ?",
-                            (sid,),
-                        )
+                        responses_df = load_slot_responses_view(sid)
                         names = responses_df["rower_name"].tolist()
                         already_signed_up = my_id in responses_df["rower_id"].tolist()
                         max_spots = int(slot["max_spots"]) if pd.notna(slot.get("max_spots")) else None
@@ -457,22 +502,22 @@ with tab_availability:
     st.title("Availability")
     st.caption("Practice is assumed every day except Sunday, unless coaches say otherwise. Click a day to mark yourself out, add a reason, then save. Days too close are locked so coaches aren't surprised last-minute.")
 
-    roster_names_df2 = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
+    roster_names_df2 = load_roster_names()
     if roster_names_df2.empty:
         st.info("No rowers on the roster yet.")
     else:
         my_name2 = st.selectbox("I am:", roster_names_df2["rower_name"].tolist(), key="avail_my_name")
         my_id2 = int(roster_names_df2[roster_names_df2["rower_name"] == my_name2]["rower_id"].iloc[0])
 
-        settings_df2 = run_query("SELECT * FROM AttendanceSettings LIMIT 1")
+        settings_df2 = load_attendance_settings_view()
         deadline_days = int(settings_df2["days_before_deadline"].iloc[0]) if not settings_df2.empty else 1
 
-        practice_events_df = run_query("SELECT event_date, event_type FROM PracticeEvents")
+        practice_events_df = load_practice_events_view()
         practice_by_date = dict(zip(practice_events_df["event_date"], practice_events_df["event_type"]))
-        regatta_dates_df = run_query("SELECT event_date, name FROM Regattas WHERE event_date IS NOT NULL")
+        regatta_dates_df = load_regatta_dates_view()
         regatta_by_date = dict(zip(regatta_dates_df["event_date"], regatta_dates_df["name"]))
 
-        my_absences_df = run_query("SELECT event_date, reason FROM DayAbsences WHERE rower_id = ?", (my_id2,))
+        my_absences_df = load_my_absences(my_id2)
         my_absence_dates = dict(zip(my_absences_df["event_date"], my_absences_df["reason"]))
 
         def day_status(date_str, date_obj):
