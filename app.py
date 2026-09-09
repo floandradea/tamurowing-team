@@ -189,16 +189,25 @@ def run_query(sql, params=None):
     return pd.read_sql_query(sql, conn, params=params)
 
 
-def run_write(sql, params=None):
+def run_write(sql, params=None, clear_only=None):
+    """
+    clear_only: optional list of specific @st.cache_data-decorated loader functions
+    to invalidate (e.g. [load_rowers]). When given, ONLY those are cleared — much
+    faster than the default, since a blanket clear forces every cached query in
+    the whole app to refetch on the next render, not just the ones this write
+    actually touched. Omit it (default) for the safe fallback on anything not
+    yet audited for its exact dependencies.
+    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(sql, params or ())
     conn.commit()
     result = cur.lastrowid
-    # Any write can affect data that's currently cached elsewhere in the app —
-    # clearing everything after a write is the safe, simple guarantee that the
-    # next rerun shows fresh data instead of a stale cached read.
-    st.cache_data.clear()
+    if clear_only:
+        for fn in clear_only:
+            fn.clear()
+    else:
+        st.cache_data.clear()
     return result
 
 
@@ -594,6 +603,31 @@ def load_weekly_lineup_seats(date_str, boat_name):
 
 
 @st.cache_data(ttl=300)
+def load_all_weekly_lineups_for_date(date_str):
+    return run_query("""
+        SELECT l.boat_name, l.seat_number, l.side, r.rower_id, r.rower_name, eq.name AS boat_used
+        FROM Lineups l
+        JOIN Rowers r ON r.rower_id = l.rower_id
+        LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
+        WHERE l.race_date = ? AND l.regatta_id IS NULL
+        ORDER BY l.boat_name, l.seat_number
+    """, (date_str,))
+
+
+def parse_wl_boat_name(boat_name):
+    """Reverse-parses a Weekly Lineups boat_name ('{Squad} {Category} {class} {label}')
+    back into its parts. Safe because we control the exact format when constructing it."""
+    parts = boat_name.split()
+    if len(parts) < 4:
+        return None
+    squad, category, boat_class = parts[0].lower(), parts[1].lower(), parts[2]
+    label = " ".join(parts[3:])
+    if squad not in ("women", "men") or category not in ("varsity", "novice") or boat_class not in BOAT_SEAT_MAP:
+        return None
+    return squad, category, boat_class, label
+
+
+@st.cache_data(ttl=300)
 def load_gendered_assignments_by_date():
     return run_query("""
         SELECT da.event_date, r.gender, da.location, COUNT(*) AS n
@@ -700,6 +734,7 @@ with tab_roster:
                     f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {score_placeholders})",
                     (clean_name, new_gender, new_weight, new_years, new_exp, new_height, new_side,
                      new_phone.strip() or None, new_email.strip() or None, *score_defaults),
+                    clear_only=[load_rowers],
                 )
                 st.session_state["add_rower_expanded"] = True
                 for k in ["new_rower_name", "new_rower_gender", "new_rower_weight", "new_rower_years",
@@ -760,7 +795,7 @@ with tab_roster:
                                    "experience_level": exp, "sweep_side": side, "is_coxswain": 1 if is_cox else 0,
                                    "phone": phone.strip() or None, "email": email.strip() or None, **score_values}
                     set_clause = ", ".join([f"{c} = ?" for c in all_fields])
-                    run_write(f"UPDATE Rowers SET {set_clause} WHERE rower_id = ?", list(all_fields.values()) + [rid])
+                    run_write(f"UPDATE Rowers SET {set_clause} WHERE rower_id = ?", list(all_fields.values()) + [rid], clear_only=[load_rowers])
                     st.toast(f"Saved {r['rower_name']}.", icon="✅")
                     st.rerun()
 
@@ -1223,7 +1258,8 @@ with tab_builder:
                         boat_equipment_id = int(match["equipment_id"].iloc[0])
 
                 # Clear any earlier saved rows for this exact boat first, so re-saving doesn't duplicate
-                run_write("DELETE FROM Lineups WHERE boat_name = ? AND regatta_id IS ?", (boat_name, regatta_id))
+                lineup_caches = [load_lineups_filtered, load_all_lineups, load_regatta_view_lineups]
+                run_write("DELETE FROM Lineups WHERE boat_name = ? AND regatta_id IS ?", (boat_name, regatta_id), clear_only=lineup_caches)
                 saved = 0
                 for seat_num, rower_name in boat["seats"].items():
                     if not rower_name:
@@ -1233,6 +1269,7 @@ with tab_builder:
                     run_write(
                         "INSERT INTO Lineups (boat_name, race_date, seat_number, side, rower_id, regatta_id, equipment_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (boat_name, None, seat_num, side, rower_id, regatta_id, boat_equipment_id),
+                        clear_only=lineup_caches,
                     )
                     saved += 1
                 st.success(f"Saved {saved} seat(s) for {boat_name} to the database.")
@@ -1829,20 +1866,22 @@ with tab_weeklysched:
             land_coach = cc2.text_input("Land coach", value=coach_map.get("land", ""), key=f"lcoach_{date_str}")
 
             if st.button("💾 Save this day", key=f"save_day_{date_str}"):
-                run_write("DELETE FROM DailyAssignments WHERE event_date = ?", (date_str,))
+                assignment_caches = [load_daily_assignments, load_gendered_assignments_by_date]
+                coach_caches = [load_daily_coaches]
+                run_write("DELETE FROM DailyAssignments WHERE event_date = ?", (date_str,), clear_only=assignment_caches)
                 name_to_id = dict(zip(rowers_df["rower_name"], rowers_df["rower_id"])) if not rowers_df.empty else {}
                 for name in water_people:
                     run_write("INSERT INTO DailyAssignments (event_date, rower_id, location, is_coxswain) VALUES (?, ?, 'water', ?)",
-                               (date_str, int(name_to_id[name]), 1 if name in cox_people else 0))
+                               (date_str, int(name_to_id[name]), 1 if name in cox_people else 0), clear_only=assignment_caches)
                 for name in land_people:
                     run_write("INSERT INTO DailyAssignments (event_date, rower_id, location, is_coxswain) VALUES (?, ?, 'land', 0)",
-                               (date_str, int(name_to_id[name])))
+                               (date_str, int(name_to_id[name])), clear_only=assignment_caches)
                 run_write("INSERT INTO DailyCoaches (event_date, location, coach_name) VALUES (?, 'water', ?) "
                            "ON CONFLICT(event_date, location) DO UPDATE SET coach_name = excluded.coach_name",
-                           (date_str, water_coach.strip() or None))
+                           (date_str, water_coach.strip() or None), clear_only=coach_caches)
                 run_write("INSERT INTO DailyCoaches (event_date, location, coach_name) VALUES (?, 'land', ?) "
                            "ON CONFLICT(event_date, location) DO UPDATE SET coach_name = excluded.coach_name",
-                           (date_str, land_coach.strip() or None))
+                           (date_str, land_coach.strip() or None), clear_only=coach_caches)
                 st.toast(f"Saved {day.strftime('%A')}.", icon="💾")
                 st.rerun()
 
@@ -1855,6 +1894,13 @@ with tab_weeklylineups:
         for seat_num, name in swap["seats"].items():
             st.session_state[f"wl_seat_{swap['key']}_{seat_num}"] = name if name else "— empty —"
 
+    if "pending_wl_edit" in st.session_state:
+        edit = st.session_state.pop("pending_wl_edit")
+        st.session_state[f"wl_squad_{edit['date_str']}"] = edit["squad"]
+        st.session_state[f"wl_category_{edit['date_str']}"] = edit["category"]
+        st.session_state[f"wl_class_{edit['date_str']}"] = edit["boat_class"]
+        st.session_state[f"wl_label_{edit['date_str']}"] = edit["label"]
+
     wl_week_start = st.date_input("Pick any date in the week you're building lineups for", value=pd.Timestamp.now().date(), key="wl_week_start")
     wl_week_start_dt = pd.Timestamp(wl_week_start)
     wl_monday = wl_week_start_dt - pd.Timedelta(days=wl_week_start_dt.weekday())
@@ -1862,12 +1908,39 @@ with tab_weeklylineups:
 
     for day in wl_weekdays:
         date_str = str(day.date())
-        with st.expander(f"{day.strftime('%A')} — {date_str}", expanded=False):
+        day_lineups = load_all_weekly_lineups_for_date(date_str)
+        boat_count_this_day = day_lineups["boat_name"].nunique() if not day_lineups.empty else 0
+        with st.expander(f"{day.strftime('%A')} — {date_str}" + (f" ({boat_count_this_day} boat(s) built)" if boat_count_this_day else ""), expanded=False):
+            if not day_lineups.empty:
+                st.markdown("**Boats already built for this day:**")
+                for existing_boat_name, boat_group in day_lineups.groupby("boat_name", sort=True):
+                    bc1, bc2, bc3 = st.columns([3, 1, 1])
+                    boat_used_here = boat_group["boat_used"].iloc[0]
+                    boat_used_text = f" — 🚣 {boat_used_here}" if pd.notna(boat_used_here) and boat_used_here else ""
+                    bc1.markdown(f"**{existing_boat_name}** ({len(boat_group)} seat(s)){boat_used_text}")
+                    if bc2.button("✏️ Edit", key=f"wl_edit_{date_str}_{existing_boat_name}"):
+                        parsed = parse_wl_boat_name(existing_boat_name)
+                        if parsed:
+                            squad_p, category_p, boat_class_p, label_p = parsed
+                            st.session_state["pending_wl_edit"] = {
+                                "date_str": date_str, "squad": squad_p, "category": category_p,
+                                "boat_class": boat_class_p, "label": label_p,
+                            }
+                            st.rerun()
+                    if bc3.button("🗑 Delete", key=f"wl_del_{date_str}_{existing_boat_name}"):
+                        run_write("DELETE FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?", (date_str, existing_boat_name),
+                                   clear_only=[load_weekly_lineup_seats, load_all_weekly_lineups_for_date])
+                        st.toast(f"Deleted {existing_boat_name}.", icon="🗑")
+                        st.rerun()
+                st.divider()
+
             wc1, wc2, wc3, wc4 = st.columns(4)
             wl_squad = wc1.selectbox("Squad", ["women", "men"], key=f"wl_squad_{date_str}")
             wl_category = wc2.selectbox("Category", ["varsity", "novice"], key=f"wl_category_{date_str}")
             wl_boat_class = wc3.selectbox("Boat class", list(BOAT_SEAT_MAP.keys()), key=f"wl_class_{date_str}")
-            wl_label = wc4.text_input("Boat label", value="A", key=f"wl_label_{date_str}", help="Use B, C, etc. for a second boat of the same class on the same day.")
+            if f"wl_label_{date_str}" not in st.session_state:
+                st.session_state[f"wl_label_{date_str}"] = "A"
+            wl_label = wc4.text_input("Boat label", key=f"wl_label_{date_str}", help="Use B, C, etc. for a second boat of the same class on the same day.")
 
             boat_name = f"{wl_squad.title()} {wl_category.title()} {wl_boat_class} {wl_label}"
             combo_key = f"{date_str}_{wl_squad}_{wl_category}_{wl_boat_class}_{wl_label}"
@@ -1900,6 +1973,14 @@ with tab_weeklylineups:
                 if not match.empty:
                     existing_equipment_name = match["name"].iloc[0]
 
+            # Rowers already seated in a DIFFERENT boat this same day — excludes this exact boat,
+            # so re-opening the boat you're already editing doesn't flag its own rowers.
+            same_day_conflicts = {}
+            if not day_lineups.empty:
+                other_boats_today = day_lineups[day_lineups["boat_name"] != boat_name]
+                for _, row in other_boats_today.iterrows():
+                    same_day_conflicts[row["rower_name"]] = row["boat_name"]
+
             selected_boat_name = st.selectbox(
                 "🚣 Physical boat used (optional)", boat_option_names,
                 index=boat_option_names.index(existing_equipment_name) if existing_equipment_name in boat_option_names else 0,
@@ -1907,8 +1988,9 @@ with tab_weeklylineups:
             )
 
             if st.button("🪄 Auto-fill", key=f"wl_autofill_{combo_key}"):
-                if len(pool):
-                    suggestion = auto_assign_boat(pool, seat_map, already_taken={})
+                autofill_pool = pool[~pool["rower_name"].isin(same_day_conflicts.keys())]
+                if len(autofill_pool):
+                    suggestion = auto_assign_boat(autofill_pool, seat_map, already_taken={})
                     st.session_state["pending_wl_swap"] = {"key": combo_key, "seats": suggestion}
                     if is_sweep:
                         for seat_num in sorted(seat_map.keys()):
@@ -1926,18 +2008,36 @@ with tab_weeklylineups:
             for seat_num, role in seat_map.items():
                 fit_scores = compute_fit(pool, role) if len(pool) else pd.Series(dtype=float)
                 pool_ranked = pool.assign(fit=fit_scores).sort_values("fit", ascending=False) if len(pool) else pool
-                options = ["— empty —"] + pool_ranked["rower_name"].tolist()
-                current_val = existing_seats_wl.get(seat_num, "— empty —") or "— empty —"
-                if current_val not in options:
-                    options = options + [current_val]
+
+                # Decorate any rower already seated in a DIFFERENT boat today with a warning suffix,
+                # while keeping a way to map the decorated label back to their real name.
+                label_to_name = {"— empty —": None}
+                display_options = ["— empty —"]
+                for rn in pool_ranked["rower_name"].tolist():
+                    if rn in same_day_conflicts:
+                        label = f"{rn} ⚠️ already in {same_day_conflicts[rn]}"
+                    else:
+                        label = rn
+                    label_to_name[label] = rn
+                    display_options.append(label)
+
+                current_real = existing_seats_wl.get(seat_num) or None
+                if current_real and current_real in same_day_conflicts:
+                    current_display = f"{current_real} ⚠️ already in {same_day_conflicts[current_real]}"
+                else:
+                    current_display = current_real or "— empty —"
+                if current_display not in display_options:
+                    display_options = display_options + [current_display]
+                    label_to_name[current_display] = current_real
 
                 cols = st.columns([0.6, 1.4, 2.2, 1, 1.2]) if is_sweep else st.columns([0.6, 1.4, 2.6, 1.4])
                 cols[0].markdown(f"**Seat {seat_num}**")
                 cols[1].markdown(f"*{role}*")
-                chosen = cols[2].selectbox("Rower", options, index=options.index(current_val),
-                                            key=f"wl_seat_{combo_key}_{seat_num}", label_visibility="collapsed")
-                seats_now[seat_num] = None if chosen == "— empty —" else chosen
-                if chosen != "— empty —":
+                chosen_label = cols[2].selectbox("Rower", display_options, index=display_options.index(current_display),
+                                                  key=f"wl_seat_{combo_key}_{seat_num}", label_visibility="collapsed")
+                chosen = label_to_name.get(chosen_label, chosen_label)
+                seats_now[seat_num] = chosen
+                if chosen:
                     fit_row = pool_ranked[pool_ranked["rower_name"] == chosen]
                     fit_val = fit_row["fit"].iloc[0] if len(fit_row) else None
                     cols[3].markdown(f"Fit: **{fit_val:.1f}**" if fit_val is not None else "Fit: —")
@@ -1960,7 +2060,8 @@ with tab_weeklylineups:
                     if not match.empty:
                         selected_equipment_id = int(match["equipment_id"].iloc[0])
 
-                run_write("DELETE FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?", (date_str, boat_name))
+                run_write("DELETE FROM Lineups WHERE race_date = ? AND regatta_id IS NULL AND boat_name = ?", (date_str, boat_name),
+                           clear_only=[load_weekly_lineup_seats, load_all_weekly_lineups_for_date])
                 name_to_id_wl = dict(zip(rowers_df["rower_name"], rowers_df["rower_id"])) if not rowers_df.empty else {}
                 saved = 0
                 for seat_num, rower_name in seats_now.items():
@@ -1969,6 +2070,7 @@ with tab_weeklylineups:
                     run_write(
                         "INSERT INTO Lineups (boat_name, race_date, seat_number, side, rower_id, regatta_id, is_visible_to_team, equipment_id) VALUES (?, ?, ?, ?, ?, NULL, 1, ?)",
                         (boat_name, date_str, seat_num, sides_now.get(seat_num, ""), int(name_to_id_wl[rower_name]), selected_equipment_id),
+                        clear_only=[load_weekly_lineup_seats, load_all_weekly_lineups_for_date],
                     )
                     saved += 1
                 st.toast(f"Saved {saved} seat(s) for {boat_name}.", icon="💾")
@@ -2009,6 +2111,7 @@ with tab_equipment:
                     run_write(
                         "INSERT INTO Equipment (name, category, status, quantity, notes, updated_date) VALUES (?, ?, ?, ?, ?, ?)",
                         (eq_name.strip(), eq_category.strip(), eq_status, int(eq_qty), eq_notes.strip() or None, str(pd.Timestamp.now().date())),
+                        clear_only=[load_equipment],
                     )
                     for k in ["new_eq_name", "new_eq_category_choice", "new_eq_category_new", "new_eq_status", "new_eq_qty", "new_eq_notes"]:
                         st.session_state.pop(k, None)
@@ -2046,7 +2149,7 @@ with tab_equipment:
                         st.caption(item["notes"])
                     if quick_status != item["status"]:
                         run_write("UPDATE Equipment SET status = ?, updated_date = ? WHERE equipment_id = ?",
-                                   (quick_status, str(pd.Timestamp.now().date()), eid))
+                                   (quick_status, str(pd.Timestamp.now().date()), eid), clear_only=[load_equipment])
                         st.toast(f"{item['name']} marked {quick_status}.", icon="🔧")
                         st.rerun()
 
@@ -2064,13 +2167,14 @@ with tab_equipment:
                                     "UPDATE Equipment SET name = ?, category = ?, quantity = ?, status = ?, notes = ?, updated_date = ? WHERE equipment_id = ?",
                                     (edit_name.strip(), edit_category.strip(), int(edit_qty), edit_status_full,
                                      edit_notes.strip() or None, str(pd.Timestamp.now().date()), eid),
+                                    clear_only=[load_equipment],
                                 )
                                 st.toast(f"Updated {edit_name.strip()}.", icon="✅")
                                 st.rerun()
                             else:
                                 st.error("Name and category can't be empty.")
                         if edel.button("🗑 Remove this item", key=f"eq_del_{eid}"):
-                            run_write("DELETE FROM Equipment WHERE equipment_id = ?", (eid,))
+                            run_write("DELETE FROM Equipment WHERE equipment_id = ?", (eid,), clear_only=[load_equipment])
                             st.rerun()
 
     with eq_tab2:
