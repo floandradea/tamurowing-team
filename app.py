@@ -566,12 +566,70 @@ def load_attendance_settings():
 
 
 @st.cache_data(ttl=300)
+def load_weekly_availability():
+    return run_query("""
+        SELECT r.rower_name, wa.day_of_week, wa.status, wa.notes
+        FROM WeeklyAvailability wa JOIN Rowers r ON r.rower_id = wa.rower_id
+        ORDER BY r.rower_name
+    """)
+
+
+@st.cache_data(ttl=300)
 def load_absences():
     return run_query("""
         SELECT da.event_date, r.rower_name, da.reason
         FROM DayAbsences da JOIN Rowers r ON r.rower_id = da.rower_id
         ORDER BY da.event_date ASC
     """)
+
+
+def is_practice_day(date_obj, practice_by_date, regatta_dates_set):
+    """Same 'practice happens every day but Sunday, unless overridden' rule used on the team site."""
+    date_str = str(date_obj)
+    if date_str in regatta_dates_set:
+        return True
+    explicit = practice_by_date.get(date_str)
+    if explicit == "off":
+        return False
+    if explicit is not None:
+        return True
+    return date_obj.weekday() != 6  # Sunday
+
+
+@st.cache_data(ttl=300)
+def compute_attendance_rates(season_start_str):
+    """Attendance % per rower = practice days attended / practice days elapsed since season start.
+    Fully computed from existing data — no separate attendance log needed."""
+    if not season_start_str:
+        return pd.DataFrame()
+    season_start = pd.Timestamp(season_start_str).date()
+    today = pd.Timestamp.now().date()
+    if season_start > today:
+        return pd.DataFrame()
+
+    practice_events_df = run_query("SELECT event_date, event_type FROM PracticeEvents")
+    practice_by_date = dict(zip(practice_events_df["event_date"], practice_events_df["event_type"]))
+    regatta_dates_df = run_query("SELECT event_date FROM Regattas WHERE event_date IS NOT NULL")
+    regatta_dates_set = set(regatta_dates_df["event_date"].tolist())
+
+    all_days = pd.date_range(season_start, today, freq="D")
+    practice_days = [d.date() for d in all_days if is_practice_day(d.date(), practice_by_date, regatta_dates_set)]
+    total_practice_days = len(practice_days)
+    if total_practice_days == 0:
+        return pd.DataFrame()
+
+    rowers = run_query("SELECT rower_id, rower_name FROM Rowers ORDER BY rower_name")
+    absences = run_query("SELECT rower_id, event_date FROM DayAbsences")
+    practice_day_strs = set(str(d) for d in practice_days)
+
+    rows = []
+    for _, r in rowers.iterrows():
+        rower_absences = absences[absences["rower_id"] == r["rower_id"]]
+        missed = sum(1 for d in rower_absences["event_date"] if d in practice_day_strs)
+        attended = total_practice_days - missed
+        rate = round(100 * attended / total_practice_days, 1)
+        rows.append({"rower_name": r["rower_name"], "attended": attended, "total": total_practice_days, "rate": rate})
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=300)
@@ -970,20 +1028,26 @@ with tab_builder:
         regatta = regatta_names[0]
 
     with st.expander("+ Add a new regatta"):
-        rc1, rc2, rc3, rc4 = st.columns([2, 1, 1, 1])
+        rc1, rc2, rc3 = st.columns(3)
         new_regatta_name = rc1.text_input("Regatta name", key="new_regatta_name")
         new_regatta_date = rc2.date_input("Date", key="new_regatta_date", value=None)
         new_regatta_season = rc3.selectbox("Season", ["Spring (2k)", "Fall (5k)"], key="new_regatta_season")
-        if rc4.button("Add Regatta"):
+        rc4, rc5 = st.columns(2)
+        new_regatta_has_deadline = rc4.checkbox("Set a response deadline?", key="new_regatta_has_deadline",
+                                                  help="Rowers must mark themselves as not-attending by this date.")
+        new_regatta_deadline = rc5.date_input("Response deadline", value=new_regatta_date, key="new_regatta_deadline") if new_regatta_has_deadline else None
+        if st.button("Add Regatta"):
             if new_regatta_name.strip():
                 clean_regatta_name = " ".join(w.capitalize() for w in new_regatta_name.strip().split())
-                existing_names_lower = [n.lower() for n in run_query("SELECT name FROM Regattas")["name"].tolist()]
+                existing_names_lower = [n.lower() for n in load_regattas()["name"].tolist()]
                 if clean_regatta_name.lower() in existing_names_lower:
                     st.error(f'A regatta named "{clean_regatta_name}" already exists — pick a different name or use the existing one.')
                 else:
                     season_val = "2k" if "2k" in new_regatta_season else "5k"
-                    run_write("INSERT OR IGNORE INTO Regattas (name, event_date, season) VALUES (?, ?, ?)",
-                               (clean_regatta_name, str(new_regatta_date) if new_regatta_date else None, season_val))
+                    run_write("INSERT OR IGNORE INTO Regattas (name, event_date, season, response_deadline) VALUES (?, ?, ?, ?)",
+                               (clean_regatta_name, str(new_regatta_date) if new_regatta_date else None, season_val,
+                                str(new_regatta_deadline) if new_regatta_deadline else None),
+                               clear_only=[load_regattas])
                     st.rerun()
 
     with st.expander("🗑 Delete a regatta"):
@@ -1653,16 +1717,33 @@ with tab_calendar:
 
     with tc2:
         st.subheader("📅 Practice Calendar")
+        st.caption("Set one workout for a whole stretch of days at once — pick a date range, which weekdays it applies to, then save.")
         with st.form("new_event_form", clear_on_submit=True):
-            ev_date = st.date_input("Date")
+            dc1, dc2 = st.columns(2)
+            ev_start = dc1.date_input("From")
+            ev_end = dc2.date_input("To", value=ev_start)
+            ev_weekdays = st.multiselect(
+                "Apply to these days of the week",
+                ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+                default=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+            )
             ev_type = st.selectbox("Type", ["water", "erg", "off"])
             ev_notes = st.text_input("Notes (optional)", placeholder="e.g. 6am, meet at the boathouse")
             added = st.form_submit_button("Add to Calendar")
             if added:
-                run_write("INSERT INTO PracticeEvents (event_date, event_type, notes) VALUES (?, ?, ?)",
-                           (str(ev_date), ev_type, ev_notes.strip() or None))
-                st.toast("Added to calendar.", icon="📅")
-                st.rerun()
+                if ev_end < ev_start:
+                    st.error("'To' date is before 'From' date.")
+                elif not ev_weekdays:
+                    st.error("Pick at least one day of the week.")
+                else:
+                    weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                    all_dates = pd.date_range(ev_start, ev_end)
+                    matching_dates = [d for d in all_dates if weekday_names[d.weekday()] in ev_weekdays]
+                    for d in matching_dates:
+                        run_write("INSERT INTO PracticeEvents (event_date, event_type, notes) VALUES (?, ?, ?)",
+                                   (str(d.date()), ev_type, ev_notes.strip() or None), clear_only=[load_practice_events])
+                    st.toast(f"Added {len(matching_dates)} day(s) to the calendar.", icon="📅")
+                    st.rerun()
 
         events_df = load_practice_events()
         if events_df.empty:
@@ -1675,7 +1756,7 @@ with tab_calendar:
                 note_text = f" — {e['notes']}" if pd.notna(e.get("notes")) and e.get("notes") else ""
                 ec1.markdown(f"**{e['event_date']}** · {label}{note_text}")
                 if ec2.button("🗑", key=f"del_event_{e['event_id']}"):
-                    run_write("DELETE FROM PracticeEvents WHERE event_id = ?", (int(e["event_id"]),))
+                    run_write("DELETE FROM PracticeEvents WHERE event_id = ?", (int(e["event_id"]),), clear_only=[load_practice_events])
                     st.rerun()
 
     st.divider()
@@ -1810,6 +1891,48 @@ with tab_calendar:
             for event_date, group in upcoming_absences.groupby("event_date"):
                 lines = "; ".join(f"{row['rower_name']} ({row['reason'] or 'no reason given'})" for _, row in group.iterrows())
                 st.markdown(f"**{event_date}** — {lines}")
+
+    st.divider()
+    st.subheader("📊 Attendance Rate")
+    st.caption("Computed automatically from marked absences against the assumed daily practice schedule — no separate log needed.")
+
+    current_season_start = settings_df["season_start_date"].iloc[0] if not settings_df.empty and "season_start_date" in settings_df.columns and pd.notna(settings_df["season_start_date"].iloc[0]) else None
+    new_season_start = st.date_input("Season start date", value=pd.Timestamp(current_season_start).date() if current_season_start else pd.Timestamp.now().date())
+    if str(new_season_start) != current_season_start:
+        if settings_df.empty:
+            run_write("INSERT INTO AttendanceSettings (season_start_date) VALUES (?)", (str(new_season_start),), clear_only=[load_attendance_settings, compute_attendance_rates])
+        else:
+            run_write("UPDATE AttendanceSettings SET season_start_date = ?", (str(new_season_start),), clear_only=[load_attendance_settings, compute_attendance_rates])
+        st.rerun()
+
+    rates_df = compute_attendance_rates(current_season_start)
+    if rates_df.empty:
+        st.caption("Set a season start date above to see attendance rates.")
+    else:
+        rates_df = rates_df.sort_values("rate")
+        for _, row in rates_df.iterrows():
+            st.progress(row["rate"] / 100, text=f"{row['rower_name']} — {row['rate']}% ({row['attended']}/{row['total']} practice days)")
+
+    st.divider()
+    st.subheader("🗓 Standing Weekly Availability")
+    st.caption("Set by rowers at the start of the semester (class schedules, etc). Reference only — day-specific absences above still take priority.")
+    weekly_avail_df = load_weekly_availability()
+    if weekly_avail_df.empty:
+        st.caption("No rowers have set their weekly availability yet.")
+    else:
+        status_icon = {"available": "🟢", "land_only": "🟡", "unavailable": "🔴"}
+        for rower_name, group in weekly_avail_df.groupby("rower_name", sort=True):
+            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            group_sorted = group.set_index("day_of_week").reindex(day_order).dropna(how="all")
+            parts = []
+            for day, row in group_sorted.iterrows():
+                if pd.isna(row.get("status")):
+                    continue
+                note_text = f" ({row['notes']})" if pd.notna(row.get("notes")) and row.get("notes") else ""
+                parts.append(f"{day[:3]}: {status_icon.get(row['status'], '')}{note_text}")
+            if parts:
+                st.markdown(f"**{rower_name}** — " + " · ".join(parts))
+        st.caption("🟢 Available · 🟡 Land only · 🔴 Unavailable")
 
 with tab_weeklysched:
     st.title("Weekly Schedule")

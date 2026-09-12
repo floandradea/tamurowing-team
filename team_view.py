@@ -106,12 +106,16 @@ def run_query(sql, params=None):
     return pd.read_sql_query(sql, get_conn(), params=params)
 
 
-def run_write(sql, params=None):
+def run_write(sql, params=None, clear_only=None):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(sql, params or ())
     conn.commit()
-    st.cache_data.clear()
+    if clear_only:
+        for fn in clear_only:
+            fn.clear()
+    else:
+        st.cache_data.clear()
     return cur.lastrowid
 
 
@@ -198,6 +202,25 @@ def load_regatta_dates_view():
 @st.cache_data(ttl=120)
 def load_my_absences(rower_id):
     return run_query("SELECT event_date, reason FROM DayAbsences WHERE rower_id = ?", (rower_id,))
+
+
+@st.cache_data(ttl=120)
+def load_my_weekly_availability(rower_id):
+    return run_query("SELECT day_of_week, status, notes FROM WeeklyAvailability WHERE rower_id = ?", (rower_id,))
+
+
+@st.cache_data(ttl=120)
+def load_regattas_needing_response():
+    return run_query("""
+        SELECT regatta_id, name, event_date, response_deadline FROM Regattas
+        WHERE event_date IS NOT NULL
+        ORDER BY event_date ASC
+    """)
+
+
+@st.cache_data(ttl=120)
+def load_my_regatta_response(rower_id, regatta_id):
+    return run_query("SELECT is_available, reason FROM Availability WHERE rower_id = ? AND regatta_id = ?", (rower_id, regatta_id))
 
 
 @st.cache_data(ttl=120)
@@ -481,7 +504,7 @@ with tab_signups:
                         sc1.markdown(f"**{slot['start_time']}–{slot['end_time']}** · {spots_text} spots — {', '.join(names) if names else '*nobody yet*'}")
                         if already_signed_up:
                             if sc2.button("Remove me", key=f"remove_{sid}"):
-                                run_write("DELETE FROM SignUpResponses WHERE slot_id = ? AND rower_id = ?", (sid, my_id))
+                                run_write("DELETE FROM SignUpResponses WHERE slot_id = ? AND rower_id = ?", (sid, my_id), clear_only=[load_slot_responses_view])
                                 st.rerun()
                         elif deadline_passed:
                             sc2.caption("Closed")
@@ -489,7 +512,7 @@ with tab_signups:
                             sc2.caption("Full")
                         else:
                             if sc2.button("Sign up", key=f"signup_{sid}"):
-                                run_write("INSERT OR IGNORE INTO SignUpResponses (event_id, rower_id, slot_id) VALUES (?, ?, ?)", (eid, my_id, sid))
+                                run_write("INSERT OR IGNORE INTO SignUpResponses (event_id, rower_id, slot_id) VALUES (?, ?, ?)", (eid, my_id, sid), clear_only=[load_slot_responses_view])
                                 st.rerun()
 
             if upcoming.empty:
@@ -508,6 +531,70 @@ with tab_availability:
     else:
         my_name2 = st.selectbox("I am:", roster_names_df2["rower_name"].tolist(), key="avail_my_name")
         my_id2 = int(roster_names_df2[roster_names_df2["rower_name"] == my_name2]["rower_id"].iloc[0])
+
+        with st.expander("🗓 My Standing Weekly Availability (set once, e.g. for class conflicts)"):
+            my_weekly_df = load_my_weekly_availability(my_id2)
+            my_weekly_map = {row["day_of_week"]: (row["status"], row["notes"]) for _, row in my_weekly_df.iterrows()}
+            status_labels = {"available": "Available", "land_only": "Land only", "unavailable": "Unavailable"}
+            new_weekly = {}
+            for day in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]:
+                current_status, current_notes = my_weekly_map.get(day, ("available", ""))
+                wc1, wc2 = st.columns([1, 2])
+                chosen_status = wc1.selectbox(day, list(status_labels.keys()), format_func=lambda k: status_labels[k],
+                                               index=list(status_labels.keys()).index(current_status), key=f"weekly_{my_id2}_{day}")
+                chosen_notes = wc2.text_input("Notes", value=current_notes or "", key=f"weekly_notes_{my_id2}_{day}",
+                                               label_visibility="collapsed", placeholder="e.g. 8am class")
+                new_weekly[day] = (chosen_status, chosen_notes)
+            if st.button("💾 Save my weekly availability", key=f"save_weekly_{my_id2}"):
+                for day, (status, notes) in new_weekly.items():
+                    run_write(
+                        "INSERT INTO WeeklyAvailability (rower_id, day_of_week, status, notes) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(rower_id, day_of_week) DO UPDATE SET status = excluded.status, notes = excluded.notes",
+                        (my_id2, day, status, notes.strip() or None),
+                        clear_only=[load_my_weekly_availability],
+                    )
+                st.toast("Saved.", icon="💾")
+                st.rerun()
+
+        st.divider()
+        st.subheader("🏆 Regatta Attendance")
+        st.caption("It's assumed you'll attend every regatta unless you mark otherwise, with a reason, before the deadline.")
+
+        regattas_needing_response = load_regattas_needing_response()
+        regattas_needing_response = regattas_needing_response[regattas_needing_response["name"] != "Practice"]
+        today_str3 = str(pd.Timestamp.now().date())
+        upcoming_regattas_resp = regattas_needing_response[regattas_needing_response["event_date"] >= today_str3]
+
+        if upcoming_regattas_resp.empty:
+            st.caption("No upcoming regattas.")
+        else:
+            for _, reg in upcoming_regattas_resp.iterrows():
+                rid_reg = int(reg["regatta_id"])
+                deadline = reg.get("response_deadline")
+                deadline_passed = pd.notna(deadline) and deadline < today_str3
+                my_response = load_my_regatta_response(my_id2, rid_reg)
+                currently_unavailable = not my_response.empty and my_response["is_available"].iloc[0] == 0
+                current_reason = my_response["reason"].iloc[0] if not my_response.empty else ""
+
+                with st.container(border=True):
+                    deadline_text = f" · respond by {deadline}" if pd.notna(deadline) else ""
+                    st.markdown(f"**{reg['name']}** — {reg['event_date']}{deadline_text}")
+                    if deadline_passed:
+                        status_text = f"🔴 Marked unavailable: {current_reason or 'no reason given'}" if currently_unavailable else "✅ Assumed attending"
+                        st.caption(f"{status_text} (responses closed)")
+                    else:
+                        mark_unavailable = st.checkbox("I can't attend this regatta", value=currently_unavailable, key=f"reg_unavail_{my_id2}_{rid_reg}")
+                        reason_input = ""
+                        if mark_unavailable:
+                            reason_input = st.text_input("Reason", value=current_reason or "", key=f"reg_reason_{my_id2}_{rid_reg}", placeholder="Why can't you attend?")
+                        if st.button("💾 Save response", key=f"reg_save_{my_id2}_{rid_reg}"):
+                            run_write("DELETE FROM Availability WHERE rower_id = ? AND regatta_id = ?", (my_id2, rid_reg),
+                                       clear_only=[load_my_regatta_response])
+                            if mark_unavailable:
+                                run_write("INSERT INTO Availability (rower_id, regatta_id, is_available, reason) VALUES (?, ?, 0, ?)",
+                                           (my_id2, rid_reg, reason_input.strip() or None), clear_only=[load_my_regatta_response])
+                            st.toast("Saved.", icon="💾")
+                            st.rerun()
 
         settings_df2 = load_attendance_settings_view()
         deadline_days = int(settings_df2["days_before_deadline"].iloc[0]) if not settings_df2.empty else 1
@@ -613,9 +700,10 @@ with tab_availability:
                                 "INSERT INTO DayAbsences (rower_id, event_date, reason) VALUES (?, ?, ?) "
                                 "ON CONFLICT(rower_id, event_date) DO UPDATE SET reason = excluded.reason",
                                 (my_id2, date_str, reasons.get(date_str) or None),
+                                clear_only=[load_my_absences],
                             )
                         elif date_str in my_absence_dates:
-                            run_write("DELETE FROM DayAbsences WHERE rower_id = ? AND event_date = ?", (my_id2, date_str))
+                            run_write("DELETE FROM DayAbsences WHERE rower_id = ? AND event_date = ?", (my_id2, date_str), clear_only=[load_my_absences])
                 st.toast("Saved.", icon="💾")
                 st.rerun()
 
