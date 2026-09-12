@@ -54,6 +54,9 @@ def check_password():
             unsafe_allow_html=True,
         )
         st.text_input("Password", type="password", on_change=password_entered, key="password_input", label_visibility="collapsed", placeholder="Password")
+        if st.button("Continue", type="primary", width='stretch'):
+            password_entered()
+            st.rerun()
         if "password_correct" in st.session_state and not st.session_state["password_correct"]:
             st.error("Incorrect password.")
     return False
@@ -157,6 +160,7 @@ def load_weekly_lineups_view():
         FROM Lineups l JOIN Rowers r ON r.rower_id = l.rower_id
         LEFT JOIN Equipment eq ON eq.equipment_id = l.equipment_id
         WHERE l.regatta_id IS NULL AND l.race_date IS NOT NULL AND l.is_visible_to_team = 1
+              AND l.race_date >= date('now')
         ORDER BY race_date, boat_name, seat_number
     """)
 
