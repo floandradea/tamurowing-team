@@ -51,7 +51,7 @@ def check_password():
     lc1, lc2, lc3 = st.columns([1, 1.1, 1])
     with lc2:
         st.markdown(
-            "<h2 style='text-align:center; color:#500000; font-family:Georgia,serif; margin-top:60px; margin-bottom:2px;'>🚣 TAMU Rowing</h2>"
+            "<h2 style='text-align:center; color:#500000; font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif; font-weight:700; margin-top:60px; margin-bottom:2px;'>TAMU Rowing</h2>"
             "<p style='text-align:center; color:#8A8177; font-size:13px; margin-bottom:18px;'>Enter the password to continue</p>",
             unsafe_allow_html=True,
         )
@@ -83,7 +83,7 @@ st.markdown("""
     }
     [data-testid="stMetricLabel"] { color: #8A8177 !important; text-transform: uppercase; font-size: 11px !important; }
     [data-testid="stMetricValue"] { color: #500000 !important; }
-    h1 { color: #500000 !important; font-family: Georgia, serif; }
+    h1 { color: #500000 !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-weight: 700; }
     h2, h3 { color: #1F1B18 !important; }
     .stButton button[kind="primary"] { background-color: #500000; border-color: #500000; }
     /* Pill-style buttons (st.pills widget) */
@@ -133,7 +133,7 @@ st.markdown("""
 
 st.markdown("""
 <div style="background:#500000; padding:16px 20px; border-radius:6px; margin-bottom:16px;">
-  <span style="color:#fff; font-family:Georgia,serif; font-size:22px; font-weight:700;">
+  <span style="color:#fff; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; font-size:22px; font-weight:700;">
     TAMU Rowing — Lineup &amp; Performance
   </span>
 </div>
@@ -251,7 +251,7 @@ SCORE_FIELDS = [
 ]
 
 # Seat-fit weight tables — same formulas as the mockup, one per seat role
-WEIGHTS = {
+DEFAULT_WEIGHTS = {
     "Bow":     {"technical": .25, "balance": .20, "consistency": .15, "rhythm": .15, "boat_moving": .10, "split2k": .10, "reliability": .05},
     "2-Seat":  {"technical": .20, "rhythm": .20, "boat_moving": .20, "consistency": .15, "split2k": .15, "balance": .10},
     "Engine":  {"split2k": .30, "boat_moving": .20, "watts": .15, "technical": .15, "consistency": .10, "rhythm": .10},
@@ -259,6 +259,18 @@ WEIGHTS = {
     "Stroke":  {"rhythm": .25, "technical": .20, "consistency": .15, "rating_control": .15, "pressure": .10, "split2k": .10, "coachability": .05},
     "Single":  {"split2k": .30, "watts": .15, "technical": .15, "rhythm": .15, "consistency": .15, "pressure": .10},
 }
+
+
+@st.cache_data(ttl=300)
+def load_seat_weights():
+    """Reads the seat-fit formula from the database — lets coaches tune it themselves
+    without needing a code change. Falls back to the built-in defaults for any
+    role/factor not yet present in the table (e.g. right after first setup)."""
+    df = run_query("SELECT role, factor, weight FROM SeatWeights")
+    weights = {role: dict(factors) for role, factors in DEFAULT_WEIGHTS.items()}
+    for _, row in df.iterrows():
+        weights.setdefault(row["role"], {})[row["factor"]] = row["weight"]
+    return weights
 
 # Which seat role each numbered seat is, per boat class
 BOAT_SEAT_MAP = {
@@ -283,7 +295,7 @@ def normalize(series, lower_is_better):
 
 
 def compute_fit(df, role):
-    weights = WEIGHTS[role]
+    weights = load_seat_weights()[role]
     norm2k = normalize(df["time_2k_sec"], lower_is_better=True)
     normwatts = normalize(df["max_watts"], lower_is_better=False)
     score = pd.Series(0.0, index=df.index)
@@ -317,7 +329,7 @@ PHRASES = {
 
 def compute_fit_and_explain(df, role):
     """Same math as compute_fit, but also returns a 'Strong X and Y.' explanation per row."""
-    weights = WEIGHTS[role]
+    weights = load_seat_weights()[role]
     norm2k = normalize(df["time_2k_sec"], lower_is_better=True)
     normwatts = normalize(df["max_watts"], lower_is_better=False)
     contributions = {}
@@ -983,6 +995,41 @@ with tab_profile:
 with tab_builder:
     st.title("Lineup Builder")
     st.caption("Boats you add here live in this browser session until you click Save — saving writes the lineup permanently to the database.")
+
+    with st.expander("⚙️ Seat-Fit Formula — see or edit how each seat's score is calculated"):
+        st.caption("Each seat weighs these factors to produce its Fit score. Weights don't need to sum to exactly 100 — they're relative to each other. Changes apply immediately to every boat.")
+        current_weights = load_seat_weights()
+        for role in DEFAULT_WEIGHTS.keys():
+            st.markdown(f"**{role}**")
+            role_weights = current_weights.get(role, DEFAULT_WEIGHTS[role])
+            factor_cols = st.columns(len(role_weights))
+            new_role_weights = {}
+            for col, (factor, weight) in zip(factor_cols, role_weights.items()):
+                new_role_weights[factor] = col.number_input(
+                    factor, min_value=0.0, max_value=1.0, step=0.05, value=float(weight),
+                    key=f"seatw_{role}_{factor}", format="%.2f",
+                )
+            total = sum(new_role_weights.values())
+            st.caption(f"Sum: {total:.2f}" + ("" if abs(total - 1.0) < 0.01 else " (doesn't need to be exactly 1.00, just relative)"))
+            if st.button(f"💾 Save {role}", key=f"seatw_save_{role}"):
+                for factor, weight in new_role_weights.items():
+                    run_write(
+                        "INSERT INTO SeatWeights (role, factor, weight) VALUES (?, ?, ?) "
+                        "ON CONFLICT(role, factor) DO UPDATE SET weight = excluded.weight",
+                        (role, factor, weight), clear_only=[load_seat_weights],
+                    )
+                st.toast(f"Updated {role} formula.", icon="⚙️")
+                st.rerun()
+        if st.button("↩️ Reset ALL seats to original defaults"):
+            for role, factors in DEFAULT_WEIGHTS.items():
+                for factor, weight in factors.items():
+                    run_write(
+                        "INSERT INTO SeatWeights (role, factor, weight) VALUES (?, ?, ?) "
+                        "ON CONFLICT(role, factor) DO UPDATE SET weight = excluded.weight",
+                        (role, factor, weight), clear_only=[load_seat_weights],
+                    )
+            st.toast("Reset to defaults.", icon="↩️")
+            st.rerun()
 
     if "boats" not in st.session_state:
         st.session_state.boats = []  # each: {id, boat_class, category, weight_class, regatta, seats:{}, sides:{}}
@@ -2024,7 +2071,16 @@ with tab_weeklylineups:
         st.session_state[f"wl_class_{edit['date_str']}"] = edit["boat_class"]
         st.session_state[f"wl_label_{edit['date_str']}"] = edit["label"]
 
-    wl_week_start = st.date_input("Pick any date in the week you're building lineups for", value=pd.Timestamp.now().date(), key="wl_week_start")
+    today_monday = pd.Timestamp.now().normalize() - pd.Timedelta(days=pd.Timestamp.now().weekday())
+    # Clear out a stale pick from a past week — this is what was causing already-happened
+    # weeks (e.g. still showing a week from days ago) to keep appearing after reopening the app.
+    if "wl_week_start" in st.session_state and pd.Timestamp(st.session_state["wl_week_start"]) < today_monday:
+        del st.session_state["wl_week_start"]
+
+    wl_week_start = st.date_input(
+        "Pick any date in the week you're building lineups for",
+        value=pd.Timestamp.now().date(), min_value=today_monday.date(), key="wl_week_start",
+    )
     wl_week_start_dt = pd.Timestamp(wl_week_start)
     wl_monday = wl_week_start_dt - pd.Timedelta(days=wl_week_start_dt.weekday())
     wl_weekdays = [wl_monday + pd.Timedelta(days=i) for i in range(6)]  # Mon-Sat

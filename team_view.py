@@ -49,7 +49,7 @@ def check_password():
     lc1, lc2, lc3 = st.columns([1, 1.1, 1])
     with lc2:
         st.markdown(
-            "<h2 style='text-align:center; color:#500000; font-family:Georgia,serif; margin-top:60px; margin-bottom:2px;'>🚣 TAMU Rowing — Team</h2>"
+            "<h2 style='text-align:center; color:#500000; font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif; font-weight:700; margin-top:60px; margin-bottom:2px;'>TAMU Rowing — Team</h2>"
             "<p style='text-align:center; color:#8A8177; font-size:13px; margin-bottom:18px;'>Enter the password to continue</p>",
             unsafe_allow_html=True,
         )
@@ -70,7 +70,7 @@ if has_team_password and not check_password():
 st.markdown("""
 <style>
     .stApp { background-color: #FAF8F5; }
-    h1 { color: #500000 !important; font-family: Georgia, serif; }
+    h1 { color: #500000 !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-weight: 700; }
     h2, h3 { color: #1F1B18 !important; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 2px solid #E4DFD6; margin-bottom: 12px; }
     .stTabs [data-baseweb="tab"] { padding: 10px 18px; font-size: 18px !important; font-weight: 700 !important; color: #8A8177 !important; }
@@ -80,7 +80,7 @@ st.markdown("""
 
 st.markdown("""
 <div style="background:#500000; padding:16px 20px; border-radius:6px; margin-bottom:16px;">
-  <span style="color:#fff; font-family:Georgia,serif; font-size:22px; font-weight:700;">
+  <span style="color:#fff; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; font-size:22px; font-weight:700;">
     TAMU Rowing — Team Site
   </span>
 </div>
